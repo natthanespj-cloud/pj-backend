@@ -67,7 +67,11 @@ def compute_bulge(p0, pm, p1):
     mx = (p0[0] + p1[0]) / 2
     my = (p0[1] + p1[1]) / 2
     sagitta = (pm[0] - mx) * nx + (pm[1] - my) * ny
-    return 2.0 * sagitta / chord
+    bulge = 2.0 * sagitta / chord
+    # Clamp: |bulge| > 1 = more than semicircle = degenerate segment → treat as straight
+    if abs(bulge) > 1.0:
+        return 0.0
+    return bulge
 
 
 def bezier_at(p0, cp1, cp2, p3, t):
