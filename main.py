@@ -229,7 +229,7 @@ def build_dxf(svg_content, selected="all"):
         for verts, is_closed in polylines:
             if len(verts) < 2: continue
             pts = [(v[0],v[1],0.0,0.0,v[2]) for v in verts]
-        msp.add_lwpolyline(pts, dxfattribs={'fv[2]': '0', 'closed': is_closed})
+        msp.add_lwpolyline(pts, dxfattribs={'layer': '0', 'closed': is_closed})
 
     buf = io.StringIO(); doc.write(buf)
     return buf.getvalue().encode('utf-8')
