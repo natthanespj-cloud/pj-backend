@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.0.0")
+app = FastAPI(title="PJ Backend", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,7 +17,7 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.0 - transform-aware DXF"}
+    return {"status": "PJ Backend v4.1 - Bezier subdivision + transform-aware DXF"}
 
 @app.get("/health")
 def health():
@@ -29,10 +29,9 @@ def health():
     return {"status": "ok", "potrace": potrace_ok}
 
 
-def parse_svg_commands(d: str):
+def parse_svg_commands(d):
     tokens = re.findall(
-        r'[MmCcLlZzHhVvSsQqTtAa]|[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?', d
-    )
+        r'[MmCcLlZzHhVvSsQqTtAa]|[-+]?[0-9]*\.?[0-9]+(?:[eE][-+]?[0-9]+)?', d)
     commands = []
     i = 0
     while i < len(tokens):
@@ -47,11 +46,10 @@ def parse_svg_commands(d: str):
     return commands
 
 
-def parse_svg_transform(t: str):
+def parse_svg_transform(t):
     tx = ty = 0.0; sx = sy = 1.0
     m = re.search(r'translate\(\s*([^,\s)]+)\s*,\s*([^)\s]+)\s*\)', t)
-    if m:
-        tx, ty = float(m.group(1)), float(m.group(2))
+    if m: tx, ty = float(m.group(1)), float(m.group(2))
     m = re.search(r'scale\(\s*([^,\s)]+)(?:\s*,\s*([^)\s]+))?\s*\)', t)
     if m:
         sx = float(m.group(1)); sy = float(m.group(2)) if m.group(2) else sx
@@ -60,7 +58,7 @@ def parse_svg_transform(t: str):
 
 def compute_bulge(p0, pm, p1):
     cx = p1[0]-p0[0]; cy = p1[1]-p0[1]
-    chord = math.sqrt(cx*cx+cy*cy)
+    chord = math.sqrt(cx*cx + cy*cy)
     if chord < 1e-10: return 0.0
     nx, ny = -cy/chord, cx/chord
     mx = (p0[0]+p1[0])/2; my = (p0[1]+p1[1])/2
@@ -76,10 +74,11 @@ def bezier_at(p0, cp1, cp2, p3, t):
     return (x, y)
 
 
-def svg_path_to_polylines(d: str, sx: float, sy_abs: float):
+def svg_path_to_polylines(d, sx, sy_abs):
     """
     Potrace SVG: <g transform="translate(0,H) scale(s,-s)">
-    DXF_x = raw_x * sx,  DXF_y = raw_y * sy_abs  (no Y-flip needed)
+    DXF_x = raw_x * sx,  DXF_y = raw_y * sy_abs  (no Y-flip)
+    Each Bezier subdivided into ~6 DXF-unit segments (matching Convertio ~6.65 avg).
     """
     commands = parse_svg_commands(d)
     result = []; verts = []; cx = cy = 0.0; start_x = start_y = 0.0; closed = False
@@ -92,10 +91,17 @@ def svg_path_to_polylines(d: str, sx: float, sy_abs: float):
 
     def add_bezier(p0x, p0y, cp1x, cp1y, cp2x, cp2y, p3x, p3y):
         nonlocal cx, cy
-        pm = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),0.5)
-        bulge = compute_bulge((dx(p0x),dy(p0y)),(dx(pm[0]),dy(pm[1])),(dx(p3x),dy(p3y)))
-        if verts: verts[-1][2] = bulge
-        verts.append([dx(p3x),dy(p3y),0.0]); cx,cy = p3x,p3y
+        chord_dxf = math.sqrt((p3x-p0x)**2*sx**2 + (p3y-p0y)**2*sy_abs**2)
+        n = min(60, max(2, int(chord_dxf / 6.0)))
+        prev = (p0x, p0y)
+        for k in range(1, n+1):
+            t2 = k/n; tm = (k-0.5)/n
+            curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
+            mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
+            b = compute_bulge((dx(prev[0]),dy(prev[1])),(dx(mid[0]),dy(mid[1])),(dx(curr[0]),dy(curr[1])))
+            if verts: verts[-1][2] = b
+            verts.append([dx(curr[0]),dy(curr[1]),0.0]); prev = curr
+        cx, cy = p3x, p3y
 
     for cmd, args in commands:
         if cmd == 'M':
@@ -103,10 +109,10 @@ def svg_path_to_polylines(d: str, sx: float, sy_abs: float):
             cx,cy = args[0],args[1]; start_x,start_y = cx,cy
             verts.append([dx(cx),dy(cy),0.0])
             for j in range(2,len(args),2):
-                cx,cy = args[j],args[j+1]; verts.append([dx(cx),dy(cy),0.0])
+                cx,cy=args[j],args[j+1]; verts.append([dx(cx),dy(cy),0.0])
         elif cmd == 'm':
             flush(); verts.clear(); closed = False
-            cx+=args[0]; cy+=args[1]; start_x,start_y = cx,cy
+            cx+=args[0]; cy+=args[1]; start_x,start_y=cx,cy
             verts.append([dx(cx),dy(cy),0.0])
             for j in range(2,len(args),2):
                 cx+=args[j]; cy+=args[j+1]; verts.append([dx(cx),dy(cy),0.0])
@@ -118,40 +124,49 @@ def svg_path_to_polylines(d: str, sx: float, sy_abs: float):
                 add_bezier(cx,cy,cx+args[j],cy+args[j+1],cx+args[j+2],cy+args[j+3],cx+args[j+4],cy+args[j+5])
         elif cmd == 'L':
             for j in range(0,len(args),2):
-                cx,cy = args[j],args[j+1]; verts.append([dx(cx),dy(cy),0.0])
+                cx,cy=args[j],args[j+1]; verts.append([dx(cx),dy(cy),0.0])
         elif cmd == 'l':
             for j in range(0,len(args),2):
                 cx+=args[j]; cy+=args[j+1]; verts.append([dx(cx),dy(cy),0.0])
         elif cmd in ('Z','z'):
-            closed = True; cx,cy = start_x,start_y
+            closed=True; cx,cy=start_x,start_y
     flush()
     return result
 
 
-def _svg_path_to_polylines_yflip(d: str, svg_h: float):
-    """Fallback: plain SVG (Y-down) to DXF (Y-up)."""
+def _svg_path_to_polylines_yflip(d, svg_h):
+    """Fallback: plain SVG (Y-down) to DXF (Y-up), with bezier subdivision."""
     commands = parse_svg_commands(d)
     result = []; verts = []; cx = cy = 0.0; start_x = start_y = 0.0; closed = False
+
     def fy(y): return svg_h - y
+
     def flush():
         if len(verts) >= 2: result.append((list(verts), closed))
+
     def add_bezier(p0x, p0y, cp1x, cp1y, cp2x, cp2y, p3x, p3y):
         nonlocal cx, cy
-        pm = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),0.5)
-        bulge = compute_bulge((p0x,fy(p0y)),(pm[0],fy(pm[1])),(p3x,fy(p3y)))
-        if verts: verts[-1][2] = bulge
-        verts.append([p3x,fy(p3y),0.0]); cx,cy = p3x,p3y
+        chord = math.sqrt((p3x-p0x)**2 + (p3y-p0y)**2)
+        n = min(60, max(2, int(chord / 6.0)))
+        prev = (p0x, p0y)
+        for k in range(1, n+1):
+            t2 = k/n; tm = (k-0.5)/n
+            curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
+            mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
+            b = compute_bulge((prev[0],fy(prev[1])),(mid[0],fy(mid[1])),(curr[0],fy(curr[1])))
+            if verts: verts[-1][2] = b
+            verts.append([curr[0],fy(curr[1]),0.0]); prev = curr
+        cx, cy = p3x, p3y
+
     for cmd, args in commands:
         if cmd == 'M':
             flush(); verts.clear(); closed = False
-            cx,cy = args[0],args[1]; start_x,start_y = cx,cy
-            verts.append([cx,fy(cy),0.0])
+            cx,cy=args[0],args[1]; start_x,start_y=cx,cy; verts.append([cx,fy(cy),0.0])
             for j in range(2,len(args),2):
-                cx,cy = args[j],args[j+1]; verts.append([cx,fy(cy),0.0])
+                cx,cy=args[j],args[j+1]; verts.append([cx,fy(cy),0.0])
         elif cmd == 'm':
             flush(); verts.clear(); closed = False
-            cx+=args[0]; cy+=args[1]; start_x,start_y = cx,cy
-            verts.append([cx,fy(cy),0.0])
+            cx+=args[0]; cy+=args[1]; start_x,start_y=cx,cy; verts.append([cx,fy(cy),0.0])
             for j in range(2,len(args),2):
                 cx+=args[j]; cy+=args[j+1]; verts.append([cx,fy(cy),0.0])
         elif cmd == 'C':
@@ -162,18 +177,19 @@ def _svg_path_to_polylines_yflip(d: str, svg_h: float):
                 add_bezier(cx,cy,cx+args[j],cy+args[j+1],cx+args[j+2],cy+args[j+3],cx+args[j+4],cy+args[j+5])
         elif cmd == 'L':
             for j in range(0,len(args),2):
-                cx,cy = args[j],args[j+1]; verts.append([cx,fy(cy),0.0])
+                cx,cy=args[j],args[j+1]; verts.append([cx,fy(cy),0.0])
         elif cmd == 'l':
             for j in range(0,len(args),2):
                 cx+=args[j]; cy+=args[j+1]; verts.append([cx,fy(cy),0.0])
         elif cmd in ('Z','z'):
-            closed = True; cx,cy = start_x,start_y
+            closed=True; cx,cy=start_x,start_y
     flush()
     return result
 
 
-def build_dxf(svg_content: str, selected: str = "all") -> bytes:
-    svg_clean = re.sub(r'\sxmlns(?:\w+)?="[^"]*"', '', svg_content)
+def build_dxf(svg_content, selected="all"):
+    """Convert SVG string to DXF bytes."""
+    svg_clean = re.sub(r'\sxmlns(?::\w+)?="[^"]*"', '', svg_content)
     svg_clean = re.sub(r'<\?xml[^?]*\?>', '', svg_clean).strip()
     try:
         root = ET.fromstring(svg_clean)
@@ -199,7 +215,7 @@ def build_dxf(svg_content: str, selected: str = "all") -> bytes:
         chosen = all_paths
     else:
         idxs = {int(x) for x in selected.split(',') if x.strip()}
-        chosen = [p for i, p in enumerate(all_paths) if i in idxs]
+        chosen = [p for i,p in enumerate(all_paths) if i in idxs]
 
     doc = ezdxf.new('R2010')
     doc.header['$INSUNITS'] = 4; doc.header['$MEASUREMENT'] = 1
@@ -208,10 +224,11 @@ def build_dxf(svg_content: str, selected: str = "all") -> bytes:
     for path_el in chosen:
         d = path_el.get('d', '').strip()
         if not d: continue
-        polylines = svg_path_to_polylines(d, scale_x, scale_y_abs) if has_transform else _svg_path_to_polylines_yflip(d, svg_h)
+        polylines = (svg_path_to_polylines(d, scale_x, scale_y_abs) if has_transform
+                     else _svg_path_to_polylines_yflip(d, svg_h))
         for verts, is_closed in polylines:
             if len(verts) < 2: continue
-            pts = [(v[0], v[1], 0.0, 0.0, v[2]) for v in verts]
+            pts = [(v[0],v[1],0.0,0.0,v[2]) for v in verts]
             msp.add_lwpolyline(pts, dxfattribs={'layer': '0', 'closed': is_closed})
 
     buf = io.StringIO(); doc.write(buf)
@@ -236,38 +253,33 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
         img = Image.open(io.BytesIO(contents)).convert("RGB")
         max_size = 2000
         if max(img.size) > max_size:
-            ratio = max_size / max(img.size)
-            img = img.resize((int(img.width*ratio), int(img.height*ratio)), Image.LANCZOS)
+            ratio = max_size/max(img.size)
+            img = img.resize((int(img.width*ratio),int(img.height*ratio)), Image.LANCZOS)
 
         import cv2, numpy as np
-        img_array = np.array(img)
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+        gray = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2GRAY)
         gray = cv2.GaussianBlur(gray, (3,3), 0)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
-        gray = clahe.apply(gray)
+        gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
         mode = cv2.THRESH_BINARY_INV if invert_bool else cv2.THRESH_BINARY
         _, bw = cv2.threshold(gray, threshold, 255, mode)
-        kernel = np.ones((2,2), np.uint8)
-        bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, kernel)
+        bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8))
         bw_pil = Image.fromarray(bw)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             bmp_path = os.path.join(tmpdir, "input.bmp")
-            svg_path_out = os.path.join(tmpdir, "output.svg")
+            svg_path = os.path.join(tmpdir, "output.svg")
             bw_pil.save(bmp_path)
             result = subprocess.run(
-                ["potrace", "--svg", "--flat", "--turdsize", "4", "--alphamax", "1",
-                 "-o", svg_path_out, bmp_path],
-                capture_output=True, timeout=60
-            )
+                ["potrace","--svg","--flat","--turdsize","4","--alphamax","1","-o",svg_path,bmp_path],
+                capture_output=True, timeout=60)
             if result.returncode != 0:
                 raise Exception("Potrace error: " + result.stderr.decode())
-            with open(svg_path_out, "r", encoding="utf-8") as f:
+            with open(svg_path,"r",encoding="utf-8") as f:
                 svg_content = f.read()
 
-        path_count = len(re.findall(r"<path", svg_content))
-        return {"svg": svg_content, "path_count": path_count, "width": img.width, "height": img.height}
-
+        return {"svg": svg_content,
+                "path_count": len(re.findall(r"<path", svg_content)),
+                "width": img.width, "height": img.height}
     except HTTPException:
         raise
     except Exception as e:
