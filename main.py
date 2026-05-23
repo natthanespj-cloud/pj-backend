@@ -229,7 +229,7 @@ def build_dxf(svg_content, selected="all"):
         for verts, is_closed in polylines:
             if len(verts) < 2: continue
             pts = [(v[0],v[1],0.0,0.0,v[2]) for v in verts]
-            msp.add_lwpolyline(pts, dxfattribs={'layer': '0', 'closed': is_closed})
+        msp.add_lwpolyline(pts, dxfattribs={'fv[2]': '0', 'closed': is_closed})
 
     buf = io.StringIO(); doc.write(buf)
     return buf.getvalue().encode('utf-8')
@@ -241,6 +241,55 @@ async def export_dxf(svg: str = Form(...), selected: str = Form("all")):
         dxf_bytes = build_dxf(svg, selected)
         return Response(content=dxf_bytes, media_type="application/dxf",
                         headers={"Content-Disposition": 'attachment; filename="pj-result.dxf"'})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/preprocess")
+async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
+    """Color image â B&W line art PNG. mode: auto, cartoon, photo"""
+    try:
+        import cv2, numpy as np
+        contents = await image.read()
+        arr = np.frombuffer(contents, np.uint8)
+        img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img_bgr is None:
+            raise HTTPException(status_code=400, detail="Cannot decode image")
+
+        max_size = 2000
+        h, w = img_bgr.shape[:2]
+        if max(h, w) > max_size:
+            ratio = max_size / max(h, w)
+            img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)), interpolation=cv2.INTER_AREA)
+
+        detected_mode = mode
+        if mode == "auto":
+            hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            dark_ratio = float((hsv[:,z.2] < 80).sum()) / (img_bgr.shape[0] * img_bgr.shape[1])
+            detected_mode = "cartoon" if dark_ratio > 0.03 else "photo"
+
+        if detected_mode == "cartoon":
+            hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+            dark_mask = (hsv[:,:,2] < 100).astype(np.uint8) * 255
+            kernel = np.ones((2,2), np.uint8)
+            dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, kernel)
+            dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel)
+            result = cv2.bitwise_not(dark_mask)
+        else:
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            gray = cv2.bilateralFilter(gray, 9, 75, 75)
+            edges = cv2.Canny(gray, 40, 120)
+            kernel = np.ones((2,2), np.uint8)
+            edges = cv2.dilate(edges, kernel, iterations=1)
+            result = cv2.bitwise_not(edges)
+
+        _, png_buf = cv2.imencode('.png', result)
+        return Response(
+            content=png_buf.tobytes(),
+            media_type="image/png",
+            headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
+        )
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
