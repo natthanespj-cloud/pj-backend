@@ -264,7 +264,7 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
         detected_mode = mode
         if mode == "auto":
             hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-            dark_ratio = float((hsv[:,z.2] < 80).sum()) / (img_bgr.shape[0] * img_bgr.shape[1])
+            dark_ratio = float((hsv[:,:,2] < 80).sum()) / (img_bgr.shape[0] * img_bgr.shape[1])
             detected_mode = "cartoon" if dark_ratio > 0.03 else "photo"
 
         if detected_mode == "cartoon":
