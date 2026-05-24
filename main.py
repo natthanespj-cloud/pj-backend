@@ -2,11 +2,11 @@ from fastapi import FastAPI, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image
-import subprocess, tempfile, os, io, re, math
+import subprocess, tempfile, os, io, re, math, base64, asyncio, urllib.request
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.1.0")
+app = FastAPI(title="PJ Backend", version="4.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -17,7 +17,7 @@ app.add_middleware(
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.1 - Bezier subdivision + transform-aware DXF"}
+    return {"status": "PJ Backend v4.2 - AI line art (Replicate) + Bezier subdivision + transform-aware DXF"}
 
 @app.get("/health")
 def health():
@@ -27,7 +27,6 @@ def health():
     except Exception:
         potrace_ok = False
     return {"status": "ok", "potrace": potrace_ok}
-
 
 def parse_svg_commands(d):
     tokens = re.findall(
@@ -45,7 +44,6 @@ def parse_svg_commands(d):
             i += 1
     return commands
 
-
 def parse_svg_transform(t):
     tx = ty = 0.0; sx = sy = 1.0
     m = re.search(r'translate\(\s*([^,\s)]+)\s*,\s*([^)\s]+)\s*\)', t)
@@ -54,7 +52,6 @@ def parse_svg_transform(t):
     if m:
         sx = float(m.group(1)); sy = float(m.group(2)) if m.group(2) else sx
     return tx, ty, sx, sy
-
 
 def compute_bulge(p0, pm, p1):
     cx = p1[0]-p0[0]; cy = p1[1]-p0[1]
@@ -66,18 +63,16 @@ def compute_bulge(p0, pm, p1):
     bulge = 2.0*sagitta/chord
     return 0.0 if abs(bulge) > 1.0 else bulge
 
-
 def bezier_at(p0, cp1, cp2, p3, t):
     mt = 1-t
     x = mt**3*p0[0]+3*mt**2*t*cp1[0]+3*mt*t**2*cp2[0]+t**3*p3[0]
     y = mt**3*p0[1]+3*mt**2*t*cp1[1]+3*mt*t**2*cp2[1]+t**3*p3[1]
     return (x, y)
 
-
 def svg_path_to_polylines(d, sx, sy_abs):
     """
     Potrace SVG: <g transform="translate(0,H) scale(s,-s)">
-    DXF_x = raw_x * sx,  DXF_y = raw_y * sy_abs  (no Y-flip)
+    DXF_x = raw_x * sx, DXF_y = raw_y * sy_abs (no Y-flip)
     Each Bezier subdivided into ~6 DXF-unit segments (matching Convertio ~6.65 avg).
     """
     commands = parse_svg_commands(d)
@@ -130,9 +125,8 @@ def svg_path_to_polylines(d, sx, sy_abs):
                 cx+=args[j]; cy+=args[j+1]; verts.append([dx(cx),dy(cy),0.0])
         elif cmd in ('Z','z'):
             closed=True; cx,cy=start_x,start_y
-    flush()
+            flush()
     return result
-
 
 def _svg_path_to_polylines_yflip(d, svg_h):
     """Fallback: plain SVG (Y-down) to DXF (Y-up), with bezier subdivision."""
@@ -183,9 +177,8 @@ def _svg_path_to_polylines_yflip(d, svg_h):
                 cx+=args[j]; cy+=args[j+1]; verts.append([cx,fy(cy),0.0])
         elif cmd in ('Z','z'):
             closed=True; cx,cy=start_x,start_y
-    flush()
+            flush()
     return result
-
 
 def build_dxf(svg_content, selected="all"):
     """Convert SVG string to DXF bytes."""
@@ -229,11 +222,10 @@ def build_dxf(svg_content, selected="all"):
         for verts, is_closed in polylines:
             if len(verts) < 2: continue
             pts = [(v[0],v[1],0.0,0.0,v[2]) for v in verts]
-        msp.add_lwpolyline(pts, dxfattribs={'layer': '0', 'closed': is_closed})
+            msp.add_lwpolyline(pts, dxfattribs={'layer': '0', 'closed': is_closed})
 
     buf = io.StringIO(); doc.write(buf)
     return buf.getvalue().encode('utf-8')
-
 
 @app.post("/export-dxf")
 async def export_dxf(svg: str = Form(...), selected: str = Form("all")):
@@ -246,7 +238,7 @@ async def export_dxf(svg: str = Form(...), selected: str = Form("all")):
 
 @app.post("/preprocess")
 async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
-    """Color image â B&W line art PNG. mode: auto, cartoon, photo"""
+    """Color image -> B&W line art PNG. mode: auto, cartoon, photo"""
     try:
         import cv2, numpy as np
         contents = await image.read()
@@ -275,6 +267,38 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
             dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel)
             result = cv2.bitwise_not(dark_mask)
         else:
+            # photo mode -- try Replicate AI first, fallback Canny if no token or error
+            replicate_token = os.environ.get("REPLICATE_API_TOKEN")
+            if replicate_token:
+                try:
+                    import replicate as _replicate
+                    _, enc = cv2.imencode('.png', img_bgr)
+                    b64_str = base64.b64encode(enc.tobytes()).decode('utf-8')
+                    data_uri = f"data:image/png;base64,{b64_str}"
+                    loop = asyncio.get_running_loop()
+                    output = await loop.run_in_executor(
+                        None,
+                        lambda: _replicate.run(
+                            "carolineec/informativedrawings",
+                            input={"image": data_uri}
+                        )
+                    )
+                    if isinstance(output, list):
+                        output = output[0]
+                    if hasattr(output, 'read'):
+                        ai_bytes = output.read()
+                    else:
+                        with urllib.request.urlopen(str(output)) as r:
+                            ai_bytes = r.read()
+                    return Response(
+                        content=ai_bytes,
+                        media_type="image/png",
+                        headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
+                    )
+                except Exception:
+                    pass  # fallback to Canny below
+
+            # Canny fallback (when no token or Replicate error)
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             gray = cv2.bilateralFilter(gray, 9, 75, 75)
             edges = cv2.Canny(gray, 40, 120)
@@ -292,7 +316,6 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-
 
 @app.post("/trace")
 async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str = Form("false")):
