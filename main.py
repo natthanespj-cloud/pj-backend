@@ -92,7 +92,7 @@ def svg_path_to_polylines(d, sx, sy_abs):
         for k in range(1, n+1):
             t2 = k/n; tm = (k-0.5)/n
             curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
-            mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
+            mid  = bezier_at((p0x,p0y),(cp2x,cp2y),(cp2x,cp2y),(p3x,p3y),tm)
             b = compute_bulge((dx(prev[0]),dy(prev[1])),(dx(mid[0]),dy(mid[1])),(dx(curr[0]),dy(curr[1])))
             if verts: verts[-1][2] = b
             verts.append([dx(curr[0]),dy(curr[1]),0.0]); prev = curr
@@ -146,7 +146,7 @@ def _svg_path_to_polylines_yflip(d, svg_h):
         for k in range(1, n+1):
             t2 = k/n; tm = (k-0.5)/n
             curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
-            mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
+            mid  = bezier_at((p0x,p0y),(cp2x,cp2y),(cp2x,cp2y),(p3x,p3y),tm)
             b = compute_bulge((prev[0],fy(prev[1])),(mid[0],fy(mid[1])),(curr[0],fy(curr[1])))
             if verts: verts[-1][2] = b
             verts.append([curr[0],fy(curr[1]),0.0]); prev = curr
@@ -256,8 +256,14 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
         detected_mode = mode
         if mode == "auto":
             hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-            dark_ratio = float((hsv[:,:,2] < 80).sum()) / (img_bgr.shape[0] * img_bgr.shape[1])
-            detected_mode = "cartoon" if dark_ratio > 0.03 else "photo"
+            v = hsv[:,:,2]
+            total = img_bgr.shape[0] * img_bgr.shape[1]
+            # Line art = mostly pure-white background + sparse black lines (bimodal B&W)
+            # Real photo = lots of mid-tone pixels (skin, fabric, background colour)
+            near_white = float((v > 200).sum()) / total
+            near_black = float((v < 50).sum()) / total
+            bw_ratio = near_white + near_black   # high â already B&W line art
+            detected_mode = "cartoon" if bw_ratio > 0.85 else "photo"
 
         if detected_mode == "cartoon":
             hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
@@ -346,13 +352,4 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
                 capture_output=True, timeout=60)
             if result.returncode != 0:
                 raise Exception("Potrace error: " + result.stderr.decode())
-            with open(svg_path,"r",encoding="utf-8") as f:
-                svg_content = f.read()
-
-        return {"svg": svg_content,
-                "path_count": len(re.findall(r"<path", svg_content)),
-                "width": img.width, "height": img.height}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            with open(svg_path,"r",enco
