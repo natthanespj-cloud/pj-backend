@@ -92,7 +92,7 @@ def svg_path_to_polylines(d, sx, sy_abs):
         for k in range(1, n+1):
             t2 = k/n; tm = (k-0.5)/n
             curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
-            mid  = bezier_at((p0x,p0y),(cp2x,cp2y),(cp2x,cp2y),(p3x,p3y),tm)
+            mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
             b = compute_bulge((dx(prev[0]),dy(prev[1])),(dx(mid[0]),dy(mid[1])),(dx(curr[0]),dy(curr[1])))
             if verts: verts[-1][2] = b
             verts.append([dx(curr[0]),dy(curr[1]),0.0]); prev = curr
@@ -146,7 +146,7 @@ def _svg_path_to_polylines_yflip(d, svg_h):
         for k in range(1, n+1):
             t2 = k/n; tm = (k-0.5)/n
             curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
-            mid  = bezier_at((p0x,p0y),(cp2x,cp2y),(cp2x,cp2y),(p3x,p3y),tm)
+            mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
             b = compute_bulge((prev[0],fy(prev[1])),(mid[0],fy(mid[1])),(curr[0],fy(curr[1])))
             if verts: verts[-1][2] = b
             verts.append([curr[0],fy(curr[1]),0.0]); prev = curr
@@ -352,4 +352,13 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
                 capture_output=True, timeout=60)
             if result.returncode != 0:
                 raise Exception("Potrace error: " + result.stderr.decode())
-            with open(svg_path,"r",enco
+            with open(svg_path,"r",encoding="utf-8") as f:
+                svg_content = f.read()
+
+        return {"svg": svg_content,
+                "path_count": len(re.findall(r"<path", svg_content)),
+                "width": img.width, "height": img.height}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
