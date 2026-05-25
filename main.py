@@ -279,9 +279,17 @@ async def _replicate_line_art(img_bgr) -> bytes | None:
         return None
     try:
         import replicate as _replicate
-        _, enc = cv2.imencode('.png', img_bgr)
+        # Resize to max 768px before encoding â PNG of 2000px = ~6MB base64 â timeout
+        # JPEG 768px = ~150KB base64 â fast, no timeout, quality still good
+        h, w = img_bgr.shape[:2]
+        max_dim = 768
+        if max(h, w) > max_dim:
+            ratio = max_dim / max(h, w)
+            img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
+                                 interpolation=cv2.INTER_AREA)
+        _, enc = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
         b64_str = base64.b64encode(enc.tobytes()).decode('utf-8')
-        data_uri = f"data:image/png;base64,{b64_str}"
+        data_uri = f"data:image/jpeg;base64,{b64_str}"
         loop = asyncio.get_running_loop()
         output = await loop.run_in_executor(
             None,
