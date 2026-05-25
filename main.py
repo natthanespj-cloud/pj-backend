@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math, base64, asyncio, urllib.request
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.3.0")
+app = FastAPI(title="PJ Backend", version="4.3.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -288,14 +288,15 @@ async def _replicate_line_art(img_bgr) -> bytes | None:
             img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
                                  interpolation=cv2.INTER_AREA)
         _, enc = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        b64_str = base64.b64encode(enc.tobytes()).decode('utf-8')
-        data_uri = f"data:image/jpeg;base64,{b64_str}"
+        # replicate>=0.25 requires a file-like object â data URIs are NOT supported
+        img_io = io.BytesIO(enc.tobytes())
+        img_io.name = "image.jpg"
         loop = asyncio.get_running_loop()
         output = await loop.run_in_executor(
             None,
             lambda: _replicate.run(
                 "carolineec/informativedrawings",
-                input={"image": data_uri}
+                input={"image": img_io}
             )
         )
         if isinstance(output, list):
@@ -306,7 +307,8 @@ async def _replicate_line_art(img_bgr) -> bytes | None:
             with urllib.request.urlopen(str(output)) as r:
                 return r.read()
     except Exception as err:
-        # Return error string encoded so callers can log it
+        import sys
+        print(f"[Replicate] ERROR: {type(err).__name__}: {err}", file=sys.stderr, flush=True)
         return None
 
 @app.post("/preprocess")
@@ -452,6 +454,4 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
                 "width": out_w, "height": out_h,
                 "ai_used": ai_bytes is not None}
     except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        
