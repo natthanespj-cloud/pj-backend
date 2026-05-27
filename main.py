@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math, base64, asyncio, urllib.request
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.3.2")
+app = FastAPI(title="PJ Backend", version="4.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -270,28 +270,69 @@ async def export_dxf(svg: str = Form(...), selected: str = Form("all")):
 
 async def _replicate_line_art(img_bgr) -> bytes | None:
     """
-    Call carolineec/informativedrawings via Replicate.
-    Returns PNG bytes of the line-art image, or None if unavailable/failed.
+    Convert photo â clean line art via Replicate.
+    Tries fofr/controlnet-lineart first (high quality portrait lineart),
+    falls back to carolineec/informativedrawings if it fails.
+    Returns PNG bytes, or None if both fail.
     """
-    import cv2
+    import cv2, sys
     replicate_token = os.environ.get("REPLICATE_API_TOKEN")
     if not replicate_token:
         return None
-    try:
-        import replicate as _replicate
-        # Resize to max 768px before encoding â PNG of 2000px = ~6MB base64 â timeout
-        # JPEG 768px = ~150KB base64 â fast, no timeout, quality still good
-        h, w = img_bgr.shape[:2]
-        max_dim = 768
-        if max(h, w) > max_dim:
-            ratio = max_dim / max(h, w)
-            img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
-                                 interpolation=cv2.INTER_AREA)
+
+    # Resize to max 768px â ControlNet works best at this range
+    h, w = img_bgr.shape[:2]
+    max_dim = 768
+    if max(h, w) > max_dim:
+        ratio = max_dim / max(h, w)
+        img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
+                             interpolation=cv2.INTER_AREA)
+
+    def encode_img():
         _, enc = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        # replicate>=0.25 requires a file-like object â data URIs are NOT supported
-        img_io = io.BytesIO(enc.tobytes())
-        img_io.name = "image.jpg"
-        loop = asyncio.get_running_loop()
+        buf = io.BytesIO(enc.tobytes())
+        buf.name = "image.jpg"
+        return buf
+
+    def read_output(output):
+        if isinstance(output, list):
+            output = output[0]
+        if hasattr(output, 'read'):
+            return output.read()
+        with urllib.request.urlopen(str(output)) as r:
+            return r.read()
+
+    import replicate as _replicate
+    loop = asyncio.get_running_loop()
+
+    # ââ Primary: fofr/controlnet-lineart âââââââââââââââââââââââââââââââââââââ
+    # ControlNet lineart preprocessor â SD generation guided by lineart structure
+    # Produces clean portrait line art with proper hair / face / clothing detail
+    try:
+        img_io = encode_img()
+        output = await loop.run_in_executor(
+            None,
+            lambda: _replicate.run(
+                "fofr/controlnet-lineart",
+                input={
+                    "image":               img_io,
+                    "prompt":              "detailed line art portrait, white background, clean black lines, professional illustration, no colors",
+                    "negative_prompt":     "color, shading, gradient, noise, blur, background, watermark",
+                    "num_outputs":         1,
+                    "guidance_scale":      9.0,
+                    "num_inference_steps": 20,
+                }
+            )
+        )
+        result = read_output(output)
+        print("[Replicate] controlnet-lineart OK", file=sys.stderr, flush=True)
+        return result
+    except Exception as err:
+        print(f"[Replicate][controlnet-lineart] {type(err).__name__}: {err}", file=sys.stderr, flush=True)
+
+    # ââ Fallback: carolineec/informativedrawings ââââââââââââââââââââââââââââââ
+    try:
+        img_io = encode_img()
         output = await loop.run_in_executor(
             None,
             lambda: _replicate.run(
@@ -299,16 +340,11 @@ async def _replicate_line_art(img_bgr) -> bytes | None:
                 input={"image": img_io}
             )
         )
-        if isinstance(output, list):
-            output = output[0]
-        if hasattr(output, 'read'):
-            return output.read()
-        else:
-            with urllib.request.urlopen(str(output)) as r:
-                return r.read()
+        result = read_output(output)
+        print("[Replicate] informativedrawings OK (fallback)", file=sys.stderr, flush=True)
+        return result
     except Exception as err:
-        import sys
-        print(f"[Replicate] ERROR: {type(err).__name__}: {err}", file=sys.stderr, flush=True)
+        print(f"[Replicate][informativedrawings] {type(err).__name__}: {err}", file=sys.stderr, flush=True)
         return None
 
 @app.post("/preprocess")
@@ -454,4 +490,6 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
                 "width": out_w, "height": out_h,
                 "ai_used": ai_bytes is not None}
     except HTTPException:
-        
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
