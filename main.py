@@ -2,11 +2,11 @@ from fastapi import FastAPI, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from PIL import Image
-import subprocess, tempfile, os, io, re, math, base64, asyncio, urllib.request
+import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.4.0")
+app = FastAPI(title="PJ Backend", version="4.5.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,16 +15,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ââ unit conversion ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── unit conversion ──────────────────────────────────────────────────────────
 # Potrace outputs SVG path coordinates in pixels at its default 72 dpi.
-# 1 potrace pixel = 1 pt = 25.4/72 mm  â  apply this to every DXF coordinate
+# 1 potrace pixel = 1 pt = 25.4/72 mm  →  apply this to every DXF coordinate
 # so CypCut (INSUNITS=4, mm) gets the correct physical size.
-PT_TO_MM = 25.4 / 72          # â 0.35278  (potrace default resolution: 72 dpi)
+PT_TO_MM = 25.4 / 72          # ≈ 0.35278  (potrace default resolution: 72 dpi)
 MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.3 - AI line art (Replicate) + correct DXF scale + bezier arcs"}
+    return {"status": "PJ Backend v4.5 - pencilSketch line art + correct DXF scale + bezier arcs"}
 
 @app.get("/health")
 def health():
@@ -33,10 +33,9 @@ def health():
         potrace_ok = r.returncode == 0
     except Exception:
         potrace_ok = False
-    has_token = bool(os.environ.get("REPLICATE_API_TOKEN"))
-    return {"status": "ok", "potrace": potrace_ok, "replicate_token": has_token}
+    return {"status": "ok", "potrace": potrace_ok}
 
-# ââ SVG / path helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+# ── SVG / path helpers ────────────────────────────────────────────────────────
 
 def parse_svg_commands(d):
     tokens = re.findall(
@@ -139,7 +138,7 @@ def svg_path_to_polylines(d, sx_mm, sy_mm):
     return result
 
 def _svg_path_to_polylines_yflip(d, svg_h, scale_mm):
-    """Fallback: plain SVG (Y-down) â DXF (Y-up), coordinates in mm."""
+    """Fallback: plain SVG (Y-down) → DXF (Y-up), coordinates in mm."""
     commands = parse_svg_commands(d)
     result = []; verts = []; cx = cy = 0.0; start_x = start_y = 0.0; closed = False
 
@@ -211,9 +210,9 @@ def build_dxf(svg_content, selected="all"):
     vb = root.get('viewBox', '0 0 500 500').split()
     svg_h = float(vb[3]) if len(vb) >= 4 else 500.0
 
-    # ââ detect potrace transform and build mm-scale factors ââââââââââââââââââ
+    # ── detect potrace transform and build mm-scale factors ──────────────────
     # Potrace emits: <g transform="translate(0,H) scale(s,-s)">
-    # Path data coords are in potrace pixels; scale s converts pixelsâSVG pts.
+    # Path data coords are in potrace pixels; scale s converts pixels→SVG pts.
     # We multiply by PT_TO_MM so DXF values come out in real millimetres.
     scale_x_raw = scale_y_raw = 1.0; has_transform = False
     for el in root.iter():
@@ -266,86 +265,42 @@ async def export_dxf(svg: str = Form(...), selected: str = Form("all")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ââ Replicate AI helper (shared by /preprocess and /trace) âââââââââââââââââââ
+# ── Local line art helper (shared by /preprocess and /trace) ─────────────────
 
-async def _replicate_line_art(img_bgr) -> bytes | None:
+def _local_line_art(img_bgr):
     """
-    Convert photo â clean line art via Replicate.
-    Tries fofr/controlnet-lineart first (high quality portrait lineart),
-    falls back to carolineec/informativedrawings if it fails.
-    Returns PNG bytes, or None if both fail.
+    Convert photo → clean line art using cv2.pencilSketch (no external API).
+    Returns uint8 numpy array: 0=black lines, 255=white background.
+    Ready for potrace (save as BMP) or preview (encode as PNG).
     """
-    import cv2, sys
-    replicate_token = os.environ.get("REPLICATE_API_TOKEN")
-    if not replicate_token:
-        return None
+    import cv2, numpy as np
 
-    # Resize to max 768px â ControlNet works best at this range
+    # Resize to max 1200px for quality
     h, w = img_bgr.shape[:2]
-    max_dim = 768
-    if max(h, w) > max_dim:
-        ratio = max_dim / max(h, w)
+    if max(h, w) > 1200:
+        ratio = 1200 / max(h, w)
         img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
                              interpolation=cv2.INTER_AREA)
 
-    def encode_img():
-        _, enc = cv2.imencode('.jpg', img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 92])
-        buf = io.BytesIO(enc.tobytes())
-        buf.name = "image.jpg"
-        return buf
+    # Normalize brightness with CLAHE (handles dark/overexposed photos)
+    lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
+    img_bgr = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
-    def read_output(output):
-        if isinstance(output, list):
-            output = output[0]
-        if hasattr(output, 'read'):
-            return output.read()
-        with urllib.request.urlopen(str(output)) as r:
-            return r.read()
+    # Reduce noise while preserving edges
+    smooth = cv2.bilateralFilter(img_bgr, 7, 50, 50)
 
-    import replicate as _replicate
-    loop = asyncio.get_running_loop()
+    # pencilSketch: gray_sketch has white background, dark pencil lines
+    gray_sketch, _ = cv2.pencilSketch(smooth, sigma_s=55, sigma_r=0.06, shade_factor=0.01)
 
-    # ââ Primary: fofr/controlnet-lineart âââââââââââââââââââââââââââââââââââââ
-    # ControlNet lineart preprocessor â SD generation guided by lineart structure
-    # Produces clean portrait line art with proper hair / face / clothing detail
-    try:
-        img_io = encode_img()
-        output = await loop.run_in_executor(
-            None,
-            lambda: _replicate.run(
-                "fofr/controlnet-lineart",
-                input={
-                    "image":               img_io,
-                    "prompt":              "detailed line art portrait, white background, clean black lines, professional illustration, no colors",
-                    "negative_prompt":     "color, shading, gradient, noise, blur, background, watermark",
-                    "num_outputs":         1,
-                    "guidance_scale":      9.0,
-                    "num_inference_steps": 20,
-                }
-            )
-        )
-        result = read_output(output)
-        print("[Replicate] controlnet-lineart OK", file=sys.stderr, flush=True)
-        return result
-    except Exception as err:
-        print(f"[Replicate][controlnet-lineart] {type(err).__name__}: {err}", file=sys.stderr, flush=True)
+    # Binary threshold: keep only clear lines (< 220 → black)
+    _, binary = cv2.threshold(gray_sketch, 220, 255, cv2.THRESH_BINARY)
 
-    # ââ Fallback: carolineec/informativedrawings ââââââââââââââââââââââââââââââ
-    try:
-        img_io = encode_img()
-        output = await loop.run_in_executor(
-            None,
-            lambda: _replicate.run(
-                "carolineec/informativedrawings",
-                input={"image": img_io}
-            )
-        )
-        result = read_output(output)
-        print("[Replicate] informativedrawings OK (fallback)", file=sys.stderr, flush=True)
-        return result
-    except Exception as err:
-        print(f"[Replicate][informativedrawings] {type(err).__name__}: {err}", file=sys.stderr, flush=True)
-        return None
+    # Remove tiny noise specks
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+    return binary  # 0=black lines, 255=white background
 
 @app.post("/preprocess")
 async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
@@ -371,7 +326,7 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
             total = img_bgr.shape[0] * img_bgr.shape[1]
             near_white = float((v > 200).sum()) / total
             near_black = float((v < 50).sum()) / total
-            bw_ratio = near_white + near_black   # high â already B&W line art
+            bw_ratio = near_white + near_black   # high → already B&W line art
             detected_mode = "cartoon" if bw_ratio > 0.85 else "photo"
 
         if detected_mode == "cartoon":
@@ -389,14 +344,17 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
                 headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
             )
         else:
-            # photo mode: Replicate AI first, Canny fallback
-            ai_bytes = await _replicate_line_art(img_bgr)
-            if ai_bytes:
+            # photo mode: local pencilSketch, Canny fallback
+            try:
+                sketch_arr = _local_line_art(img_bgr)
+                _, png_buf = cv2.imencode('.png', sketch_arr)
                 return Response(
-                    content=ai_bytes,
+                    content=png_buf.tobytes(),
                     media_type="image/png",
                     headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
                 )
+            except Exception:
+                pass
             # Canny fallback
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             gray = cv2.bilateralFilter(gray, 9, 75, 75)
@@ -423,7 +381,7 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
         arr = np.frombuffer(contents, np.uint8)
         img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-        # ââ resize ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+        # ── resize ──────────────────────────────────────────────────────────
         max_size = 2000
         if img_bgr is not None:
             h, w = img_bgr.shape[:2]
@@ -440,23 +398,20 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
             img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
             out_w, out_h = img_pil.width, img_pil.height
 
-        # ââ try Replicate AI for clean line art ââââââââââââââââââââââââââââââ
-        # AI line art â potrace = dramatically better curves than Canny â potrace
+        # ── local pencilSketch line art ──────────────────────────────────────
         bw_array = None
-        ai_bytes = await _replicate_line_art(img_bgr)
-        if ai_bytes:
-            try:
-                ai_arr = np.frombuffer(ai_bytes, np.uint8)
-                ai_img = cv2.imdecode(ai_arr, cv2.IMREAD_GRAYSCALE)
-                if ai_img is not None:
-                    # AI output: white background, black lines
-                    # Invert if needed (make black = ink), then threshold
-                    _, bw_array = cv2.threshold(ai_img, 200, 255,
-                                                cv2.THRESH_BINARY if invert_bool else cv2.THRESH_BINARY_INV)
-            except Exception:
-                bw_array = None
+        sketch_ok = False
+        try:
+            sketch = _local_line_art(img_bgr)
+            # sketch: 0=black lines, 255=white bg
+            # potrace traces dark pixels → need 0=lines (already correct)
+            # invert_bool flips which pixels are "ink"
+            bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
+            sketch_ok = True
+        except Exception:
+            bw_array = None
 
-        # ââ Canny/threshold fallback âââââââââââââââââââââââââââââââââââââââââ
+        # ── Canny/threshold fallback ─────────────────────────────────────────
         if bw_array is None:
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (3,3), 0)
@@ -488,7 +443,7 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
         return {"svg": svg_content,
                 "path_count": len(re.findall(r"<path", svg_content)),
                 "width": out_w, "height": out_h,
-                "ai_used": ai_bytes is not None}
+                "ai_used": sketch_ok}
     except HTTPException:
         raise
     except Exception as e:
