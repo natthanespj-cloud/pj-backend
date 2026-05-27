@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.5.1")
+app = FastAPI(title="PJ Backend", version="4.6.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.5.1 - pencilSketch OTSU threshold fix", "version": "4.5.1"}
+    return {"status": "PJ Backend v4.6.0 - controlnet-hed AI line art", "version": "4.6.0"}
 
 @app.get("/health")
 def health():
@@ -33,7 +33,7 @@ def health():
         potrace_ok = r.returncode == 0
     except Exception:
         potrace_ok = False
-    return {"status": "ok", "version": "4.5.1", "potrace": potrace_ok}
+    return {"status": "ok", "version": "4.6.0", "potrace": potrace_ok}
 
 # ── SVG / path helpers ────────────────────────────────────────────────────────
 
@@ -100,7 +100,7 @@ def svg_path_to_polylines(d, sx_mm, sy_mm):
         prev = (p0x, p0y)
         for k in range(1, n+1):
             t2 = k/n; tm = (k-0.5)/n
-            curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
+            curr = bezier_at((p0x,p0y),{cp1x,cp1y},(cp2x,cp2y),(p3x,p3y),t2)
             mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
             b = compute_bulge((dx(prev[0]),dy(prev[1])),(dx(mid[0]),dy(mid[1])),(dx(curr[0]),dy(curr[1])))
             if verts: verts[-1][2] = b
@@ -265,41 +265,97 @@ async def export_dxf(svg: str = Form(...), selected: str = Form("all")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── Local line art helper (shared by /preprocess and /trace) ─────────────────
+# ── AI line art via Replicate controlnet-hed ─────────────────────────────────
+
+def _ai_line_art(img_bgr):
+    """
+    Convert photo → clean line art using jagilley/controlnet-hed via Replicate.
+    Returns uint8 numpy array: 0=black lines, 255=white background.
+    Raises exception if REPLICATE_API_TOKEN not set or call fails.
+    """
+    import cv2, numpy as np, replicate as _replicate, io as _io
+    from PIL import Image as _PilImage
+
+    # Check token
+    if not os.environ.get("REPLICATE_API_TOKEN"):
+        raise Exception("REPLICATE_API_TOKEN not set")
+
+    # Resize to 768px max (sweet spot for controlnet-hed)
+    h, w = img_bgr.shape[:2]
+    if max(h, w) > 768:
+        ratio = 768 / max(h, w)
+        img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
+                             interpolation=cv2.INTER_AREA)
+
+    # Encode as JPEG for Replicate
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    pil_img = _PilImage.fromarray(img_rgb)
+    buf = _io.BytesIO()
+    pil_img.save(buf, format="JPEG", quality=90)
+    buf.seek(0)
+
+    output = _replicate.run(
+        "jagilley/controlnet-hed:cde353130c86f37d0af4060cd757ab3009cac68caca13c21294823a8cef1f63e",
+        input={
+            "input_image": buf,
+            "prompt": "line art, white background, pure black outline, coloring book, clean lines, no shading, no color fill, vector illustration",
+            "num_samples": "1",
+            "image_resolution": "512",
+            "ddim_steps": 30,
+            "scale": 9,
+            "a_prompt": "best quality, extremely detailed, white background, crisp clean black lines",
+            "n_prompt": "color, shading, gray tone, texture, noise, blur, photorealistic, painting, watercolor, sketch marks, hatching"
+        }
+    )
+
+    if not output:
+        raise Exception("Replicate returned no output")
+
+    img_out = output[0] if isinstance(output, list) else output
+    img_bytes = img_out.read()
+
+    arr = np.frombuffer(img_bytes, np.uint8)
+    result_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if result_bgr is None:
+        raise Exception("Cannot decode Replicate output image")
+
+    gray = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY)
+    _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return binary  # 0=black lines, 255=white background
+
+# ── Local line art fallback (no API needed) ───────────────────────────────────
 
 def _local_line_art(img_bgr):
     """
-    Convert photo → clean line art using cv2.pencilSketch (no external API).
+    Convert photo → line art using cv2.pencilSketch (fallback, no external API).
     Returns uint8 numpy array: 0=black lines, 255=white background.
-    Ready for potrace (save as BMP) or preview (encode as PNG).
     """
     import cv2, numpy as np
 
-    # Resize to max 1200px for quality
+    # Resize to max 1200px
     h, w = img_bgr.shape[:2]
     if max(h, w) > 1200:
         ratio = 1200 / max(h, w)
         img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
                              interpolation=cv2.INTER_AREA)
 
-    # Normalize brightness with CLAHE (handles dark/overexposed photos)
+    # Normalize brightness with CLAHE
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
     l, a, b = cv2.split(lab)
     l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
     img_bgr = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
 
-    # Reduce noise while preserving edges
-    smooth = cv2.bilateralFilter(img_bgr, 7, 50, 50)
+    # Strong bilateral filter to smooth while preserving edges
+    smooth = cv2.bilateralFilter(img_bgr, d=15, sigmaColor=80, sigmaSpace=80)
 
-    # pencilSketch: gray_sketch has white background, dark pencil lines
-    gray_sketch, _ = cv2.pencilSketch(smooth, sigma_s=55, sigma_r=0.06, shade_factor=0.01)
+    # pencilSketch with tuned params for cleaner output
+    gray_sketch, _ = cv2.pencilSketch(smooth, sigma_s=80, sigma_r=0.07, shade_factor=0.005)
 
-    # OTSU auto-threshold: finds optimal split between lines and background
-    # Much better than fixed 220 for real photos with varied lighting
+    # OTSU auto-threshold
     _, binary = cv2.threshold(gray_sketch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Remove tiny noise specks
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+    # Remove noise (3×3 open is more aggressive than 2×2)
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
     return binary  # 0=black lines, 255=white background
 
@@ -336,26 +392,31 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
             kernel = np.ones((2,2), np.uint8)
             dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_OPEN, kernel)
             dark_mask = cv2.morphologyEx(dark_mask, cv2.MORPH_CLOSE, kernel)
-            result_bytes = None
             _, png_buf = cv2.imencode('.png', cv2.bitwise_not(dark_mask))
-            result_bytes = png_buf.tobytes()
             return Response(
-                content=result_bytes,
+                content=png_buf.tobytes(),
                 media_type="image/png",
                 headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
             )
         else:
-            # photo mode: local pencilSketch, Canny fallback
+            # photo mode: AI (controlnet-hed) → local pencilSketch → Canny
+            sketch_arr = None
             try:
-                sketch_arr = _local_line_art(img_bgr)
+                sketch_arr = _ai_line_art(img_bgr)
+            except Exception:
+                pass
+            if sketch_arr is None:
+                try:
+                    sketch_arr = _local_line_art(img_bgr)
+                except Exception:
+                    pass
+            if sketch_arr is not None:
                 _, png_buf = cv2.imencode('.png', sketch_arr)
                 return Response(
                     content=png_buf.tobytes(),
                     media_type="image/png",
                     headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
                 )
-            except Exception:
-                pass
             # Canny fallback
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             gray = cv2.bilateralFilter(gray, 9, 75, 75)
@@ -399,18 +460,25 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
             img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
             out_w, out_h = img_pil.width, img_pil.height
 
-        # ── local pencilSketch line art ──────────────────────────────────────
+        # ── AI → local pencilSketch → Canny fallback ────────────────────────
         bw_array = None
         sketch_ok = False
+        # Try AI (controlnet-hed) first
         try:
-            sketch = _local_line_art(img_bgr)
-            # sketch: 0=black lines, 255=white bg
-            # potrace traces dark pixels → need 0=lines (already correct)
-            # invert_bool flips which pixels are "ink"
+            sketch = _ai_line_art(img_bgr)
             bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
             sketch_ok = True
         except Exception:
-            bw_array = None
+            pass
+        # Fallback: local pencilSketch
+        if bw_array is None:
+            try:
+                sketch = _local_line_art(img_bgr)
+                # sketch: 0=black lines, 255=white bg
+                bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
+                sketch_ok = True
+            except Exception:
+                bw_array = None
 
         # ── Canny/threshold fallback ─────────────────────────────────────────
         if bw_array is None:
@@ -420,8 +488,6 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
             mode_flag = cv2.THRESH_BINARY_INV if invert_bool else cv2.THRESH_BINARY
             _, bw_array = cv2.threshold(gray, threshold, 255, mode_flag)
             bw_array = cv2.morphologyEx(bw_array, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8))
-
-        bw_pil = Image.fromarray(bw_array)
 
         bw_pil = Image.fromarray(bw_array)
 
