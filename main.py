@@ -445,4 +445,7 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
                 "path_count": len(re.findall(r"<path", svg_content)),
                 "width": out_w, "height": out_h,
                 "ai_used": sketch_ok}
-    except
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
