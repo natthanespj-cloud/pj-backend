@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.5.0")
+app = FastAPI(title="PJ Backend", version="4.5.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.5 - pencilSketch line art + correct DXF scale + bezier arcs"}
+    return {"status": "PJ Backend v4.5.1 - pencilSketch OTSU threshold fix", "version": "4.5.1"}
 
 @app.get("/health")
 def health():
@@ -33,7 +33,7 @@ def health():
         potrace_ok = r.returncode == 0
     except Exception:
         potrace_ok = False
-    return {"status": "ok", "potrace": potrace_ok}
+    return {"status": "ok", "version": "4.5.1", "potrace": potrace_ok}
 
 # ── SVG / path helpers ────────────────────────────────────────────────────────
 
@@ -294,8 +294,9 @@ def _local_line_art(img_bgr):
     # pencilSketch: gray_sketch has white background, dark pencil lines
     gray_sketch, _ = cv2.pencilSketch(smooth, sigma_s=55, sigma_r=0.06, shade_factor=0.01)
 
-    # Binary threshold: keep only clear lines (< 220 → black)
-    _, binary = cv2.threshold(gray_sketch, 220, 255, cv2.THRESH_BINARY)
+    # OTSU auto-threshold: finds optimal split between lines and background
+    # Much better than fixed 220 for real photos with varied lighting
+    _, binary = cv2.threshold(gray_sketch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
     # Remove tiny noise specks
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
@@ -444,7 +445,4 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
                 "path_count": len(re.findall(r"<path", svg_content)),
                 "width": out_w, "height": out_h,
                 "ai_used": sketch_ok}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except
