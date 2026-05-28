@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.6.0")
+app = FastAPI(title="PJ Backend", version="4.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.6.0 - controlnet-hed AI line art", "version": "4.6.0"}
+    return {"status": "PJ Backend v4.7.0 - XDoG local + controlnet-hed AI line art", "version": "4.7.0"}
 
 @app.get("/health")
 def health():
@@ -33,7 +33,7 @@ def health():
         potrace_ok = r.returncode == 0
     except Exception:
         potrace_ok = False
-    return {"status": "ok", "version": "4.6.0", "potrace": potrace_ok}
+    return {"status": "ok", "version": "4.7.0", "potrace": potrace_ok}
 
 # ── SVG / path helpers ────────────────────────────────────────────────────────
 
@@ -100,7 +100,7 @@ def svg_path_to_polylines(d, sx_mm, sy_mm):
         prev = (p0x, p0y)
         for k in range(1, n+1):
             t2 = k/n; tm = (k-0.5)/n
-            curr = bezier_at((p0x,p0y),{cp1x,cp1y},(cp2x,cp2y),(p3x,p3y),t2)
+            curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
             mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
             b = compute_bulge((dx(prev[0]),dy(prev[1])),(dx(mid[0]),dy(mid[1])),(dx(curr[0]),dy(curr[1])))
             if verts: verts[-1][2] = b
@@ -274,9 +274,9 @@ def _ai_line_art(img_bgr):
     Raises exception if REPLICATE_API_TOKEN not set or call fails.
     """
     import cv2, numpy as np, replicate as _replicate, io as _io
+    import urllib.request as _urllib_req
     from PIL import Image as _PilImage
 
-    # Check token
     if not os.environ.get("REPLICATE_API_TOKEN"):
         raise Exception("REPLICATE_API_TOKEN not set")
 
@@ -287,7 +287,7 @@ def _ai_line_art(img_bgr):
         img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
                              interpolation=cv2.INTER_AREA)
 
-    # Encode as JPEG for Replicate
+    # Encode as JPEG for Replicate (must use io.BytesIO, not base64)
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil_img = _PilImage.fromarray(img_rgb)
     buf = _io.BytesIO()
@@ -308,26 +308,49 @@ def _ai_line_art(img_bgr):
         }
     )
 
-    if not output:
+    # Handle all Replicate SDK output formats (>= 0.25):
+    # may be iterator, list of FileOutput, list of URL strings, or single item
+    if hasattr(output, '__iter__') and not isinstance(output, (str, bytes)):
+        output_list = list(output)
+    else:
+        output_list = [output] if output is not None else []
+
+    if not output_list:
         raise Exception("Replicate returned no output")
 
-    img_out = output[0] if isinstance(output, list) else output
-    img_bytes = img_out.read()
+    item = output_list[0]
+
+    # Fetch image bytes from whatever format Replicate returns
+    if isinstance(item, str):
+        # URL string
+        with _urllib_req.urlopen(item) as resp:
+            img_bytes = resp.read()
+    elif hasattr(item, 'read'):
+        # FileOutput / file-like object
+        img_bytes = item.read()
+    elif hasattr(item, 'url'):
+        # Object with .url attribute
+        with _urllib_req.urlopen(item.url) as resp:
+            img_bytes = resp.read()
+    else:
+        raise Exception(f"Unrecognized Replicate output type: {type(item)}")
 
     arr = np.frombuffer(img_bytes, np.uint8)
     result_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if result_bgr is None:
         raise Exception("Cannot decode Replicate output image")
 
+    # AI output is often already near-binary; OTSU handles both clean and noisy cases
     gray = cv2.cvtColor(result_bgr, cv2.COLOR_BGR2GRAY)
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return binary  # 0=black lines, 255=white background
 
-# ── Local line art fallback (no API needed) ───────────────────────────────────
+# ── Local line art: XDoG (Extended Difference of Gaussians) ──────────────────
 
 def _local_line_art(img_bgr):
     """
-    Convert photo → line art using cv2.pencilSketch (fallback, no external API).
+    Convert photo → clean line art using XDoG algorithm.
+    Gives crisp illustration + anime/cartoon style edges for laser cutting.
     Returns uint8 numpy array: 0=black lines, 255=white background.
     """
     import cv2, numpy as np
@@ -339,23 +362,41 @@ def _local_line_art(img_bgr):
         img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)),
                              interpolation=cv2.INTER_AREA)
 
-    # Normalize brightness with CLAHE
+    # Normalize contrast with CLAHE on L channel
     lab = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2LAB)
-    l, a, b = cv2.split(lab)
-    l = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l)
-    img_bgr = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+    l_ch, a_ch, b_ch = cv2.split(lab)
+    l_ch = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(l_ch)
+    img_bgr = cv2.cvtColor(cv2.merge([l_ch, a_ch, b_ch]), cv2.COLOR_LAB2BGR)
 
-    # Strong bilateral filter to smooth while preserving edges
-    smooth = cv2.bilateralFilter(img_bgr, d=15, sigmaColor=80, sigmaSpace=80)
+    # Light bilateral filter: smooth noise, preserve edges
+    smooth = cv2.bilateralFilter(img_bgr, d=9, sigmaColor=75, sigmaSpace=75)
 
-    # pencilSketch with tuned params for cleaner output
-    gray_sketch, _ = cv2.pencilSketch(smooth, sigma_s=80, sigma_r=0.07, shade_factor=0.005)
+    # Convert to float grayscale [0, 1]
+    gray = cv2.cvtColor(smooth, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
-    # OTSU auto-threshold
-    _, binary = cv2.threshold(gray_sketch, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # ── XDoG (Extended Difference of Gaussians) ──────────────────────────────
+    # Parameters tuned for illustration + anime combined style
+    sigma   = 1.0    # base Gaussian sigma (edge sharpness)
+    k       = 1.6    # sigma ratio — k*sigma for second Gaussian
+    epsilon = 0.98   # threshold level (higher = fewer, cleaner lines)
+    phi     = 200.0  # steepness of soft threshold (higher = crisper edges)
 
-    # Remove noise (3×3 open is more aggressive than 2×2)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    g1 = cv2.GaussianBlur(gray, (0, 0), sigma)
+    g2 = cv2.GaussianBlur(gray, (0, 0), sigma * k)
+
+    # DoG response: positive = background, negative = edge
+    dog = g1 - epsilon * g2
+
+    # XDoG soft threshold: background → 1.0, edges → 0.0
+    xdog = np.where(dog >= 0, 1.0, 1.0 + np.tanh(phi * dog))
+    xdog = np.clip(xdog, 0.0, 1.0)
+
+    # Convert to uint8 (255=white bg, 0=black lines) and binarize
+    result = (xdog * 255).astype(np.uint8)
+    _, binary = cv2.threshold(result, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Remove tiny speckle noise
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
 
     return binary  # 0=black lines, 255=white background
 
@@ -399,7 +440,7 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
                 headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
             )
         else:
-            # photo mode: AI (controlnet-hed) → local pencilSketch → Canny
+            # photo mode: AI (controlnet-hed) → XDoG local → Canny fallback
             sketch_arr = None
             try:
                 sketch_arr = _ai_line_art(img_bgr)
@@ -460,9 +501,10 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
             img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
             out_w, out_h = img_pil.width, img_pil.height
 
-        # ── AI → local pencilSketch → Canny fallback ────────────────────────
+        # ── AI → XDoG local → Canny fallback ────────────────────────────────
         bw_array = None
         sketch_ok = False
+
         # Try AI (controlnet-hed) first
         try:
             sketch = _ai_line_art(img_bgr)
@@ -470,11 +512,11 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
             sketch_ok = True
         except Exception:
             pass
-        # Fallback: local pencilSketch
+
+        # Fallback: XDoG local line art
         if bw_array is None:
             try:
                 sketch = _local_line_art(img_bgr)
-                # sketch: 0=black lines, 255=white bg
                 bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
                 sketch_ok = True
             except Exception:
