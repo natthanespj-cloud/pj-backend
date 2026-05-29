@@ -551,3 +551,81 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
         if img_bgr is not None:
             h, w = img_bgr.shape[:2]
             if max(h, w) > max_size:
+                ratio = max_size / max(h, w)
+                img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)), interpolation=cv2.INTER_AREA)
+            out_w, out_h = img_bgr.shape[1], img_bgr.shape[0]
+        else:
+            # fallback PIL path
+            img_pil = Image.open(io.BytesIO(contents)).convert("RGB")
+            if max(img_pil.size) > max_size:
+                ratio = max_size / max(img_pil.size)
+                img_pil = img_pil.resize((int(img_pil.width*ratio), int(img_pil.height*ratio)), Image.LANCZOS)
+            img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
+            out_w, out_h = img_pil.width, img_pil.height
+
+        # ── Detect photo vs cartoon ──────────────────────────────────────────
+        hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+        v = hsv[:, :, 2]
+        total_px = img_bgr.shape[0] * img_bgr.shape[1]
+        bw_ratio = float((v > 200).sum() + (v < 50).sum()) / total_px
+        is_photo = bw_ratio <= 0.85
+
+        # ── AI → local (photo/cartoon) → Canny fallback ─────────────────────
+        bw_array = None
+        sketch_ok = False
+
+        # Try AI (controlnet-hed) first
+        try:
+            sketch = _ai_line_art(img_bgr)
+            bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
+            sketch_ok = True
+        except Exception:
+            pass
+
+        # Local fallback: photo → bilateral+kmeans, cartoon → XDoG
+        if bw_array is None:
+            try:
+                if is_photo:
+                    sketch = _photo_line_art(img_bgr)
+                else:
+                    sketch = _local_line_art(img_bgr)
+                bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
+                sketch_ok = True
+            except Exception:
+                bw_array = None
+
+        # ── Canny/threshold fallback ─────────────────────────────────────────
+        if bw_array is None:
+            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+            gray = cv2.GaussianBlur(gray, (3,3), 0)
+            gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
+            mode_flag = cv2.THRESH_BINARY_INV if invert_bool else cv2.THRESH_BINARY
+            _, bw_array = cv2.threshold(gray, threshold, 255, mode_flag)
+            bw_array = cv2.morphologyEx(bw_array, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8))
+
+        bw_pil = Image.fromarray(bw_array)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            bmp_path = os.path.join(tmpdir, "input.bmp")
+            svg_path = os.path.join(tmpdir, "output.svg")
+            bw_pil.save(bmp_path)
+            result = subprocess.run(
+                ["potrace","--svg","--flat",
+                 "--turdsize","2",
+                 "--alphamax","1",
+                 "--opttolerance","0.4",
+                 "-o", svg_path, bmp_path],
+                capture_output=True, timeout=60)
+            if result.returncode != 0:
+                raise Exception("Potrace error: " + result.stderr.decode())
+            with open(svg_path,"r",encoding="utf-8") as f:
+                svg_content = f.read()
+
+        return {"svg": svg_content,
+                "path_count": len(re.findall(r"<path", svg_content)),
+                "width": out_w, "height": out_h,
+                "ai_used": sketch_ok}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
