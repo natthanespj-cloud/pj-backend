@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.8.0")
+app = FastAPI(title="PJ Backend", version="4.9.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.8.0 - photo line art (bilateral+kmeans) + XDoG cartoon + controlnet-hed AI", "version": "4.8.0"}
+    return {"status": "PJ Backend v4.9.0 - photo line art (GrabCut+bilateral+kmeans) + XDoG cartoon", "version": "4.9.0"}
 
 @app.get("/health")
 def health():
@@ -175,7 +175,7 @@ def _svg_path_to_polylines_yflip(d, svg_h, scale_mm):
                 cx+=args[j]; cy+=args[j+1]; verts.append([fx(cx),fy(cy),0.0])
         elif cmd == 'C':
             for j in range(0,len(args),6):
-                add_bezier(cx,cy,args[j],args[j+1],args[j+2],args[j+3],args[j+4],args[j+5])
+                add_bezier(cx,cy,args[j],args[j+1],args[j+3],args[j+3],args[j+4],args[j+5])
         elif cmd == 'c':
             for j in range(0,len(args),6):
                 add_bezier(cx,cy,cx+args[j],cy+args[j+1],cx+args[j+2],cy+args[j+3],cx+args[j+4],cy+args[j+5])
@@ -404,63 +404,92 @@ def _local_line_art(img_bgr):
 
 def _photo_line_art(img_bgr):
     """
-    Convert real photo → coloring-book / digital-tracing style line art.
-    Captures major silhouette outlines only — no texture/skin/fabric noise.
+    Convert real photo → clean line art for laser cutting.
 
     Pipeline:
-      1. Heavy bilateral smoothing (3 passes) → removes texture, keeps big edges
-      2. K-means quantization (8 clusters)    → flat colour zones like posterize
-      3. Canny + gradient on quantized image  → only region boundary lines
-      4. Morphological cleanup                → connect gaps, kill speckles
+      1. Fast GrabCut on downscaled image → subject mask (removes background)
+      2. Background filled with neutral gray → no spurious edge at boundary
+      3. Heavy bilateral (7 passes)        → kills skin/fabric texture
+      4. K-means 4 clusters                → merge into major colour zones
+      5. Canny(18,50) on quantized         → main region boundary lines
+      6. Detail pass: Canny(120,300) on lightly blurred → eyes, glasses, hair
+      7. Mask edges to subject region      → suppress background objects
+      8. Connected-component size filter   → remove tiny noise blobs
+      9. Dilate ×1                         → thicken for laser visibility
 
     Returns uint8 numpy array: 0=black lines, 255=white background.
     """
     import cv2, numpy as np
 
-    # Resize to max 1000 px (fast enough for k-means, plenty of detail)
+    # ── Step 0: Resize to max 1000 px ────────────────────────────────────────
     h, w = img_bgr.shape[:2]
     if max(h, w) > 1000:
         ratio = 1000 / max(h, w)
         img_bgr = cv2.resize(img_bgr, (int(w * ratio), int(h * ratio)),
                              interpolation=cv2.INTER_AREA)
+    h, w = img_bgr.shape[:2]
 
-    # ── Step 1: Heavy bilateral smoothing (3 passes) ─────────────────────────
-    # Each pass: d=15, sigmaColor/Space=150  →  strong texture suppression
-    smooth = img_bgr.copy()
-    for _ in range(3):
-        smooth = cv2.bilateralFilter(smooth, d=15, sigmaColor=150, sigmaSpace=150)
+    # ── Step 1: Fast GrabCut at 400 px → subject mask ────────────────────────
+    # Downscale for speed (~0.7 s), upscale result mask back to full size
+    scale  = 400 / max(h, w)
+    small  = cv2.resize(img_bgr, (int(w * scale), int(h * scale)))
+    sh, sw = small.shape[:2]
+    gc_mask = np.zeros(small.shape[:2], np.uint8)
+    bgd_m   = np.zeros((1, 65), np.float64)
+    fgd_m   = np.zeros((1, 65), np.float64)
+    rect    = (int(sw * 0.01), int(sh * 0.01), int(sw * 0.97), int(sh * 0.97))
+    cv2.grabCut(small, gc_mask, rect, bgd_m, fgd_m, 3, cv2.GC_INIT_WITH_RECT)
+    fg_small = np.where((gc_mask == 1) | (gc_mask == 3), 255, 0).astype(np.uint8)
+    fg = cv2.resize(fg_small, (w, h), interpolation=cv2.INTER_NEAREST)
+    fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((20, 20), np.uint8))
+    fg = cv2.dilate(fg, np.ones((5, 5), np.uint8), iterations=2)
 
-    # ── Step 2: K-means colour quantization (8 clusters) ─────────────────────
+    # ── Step 2: Background → neutral gray ────────────────────────────────────
+    work = img_bgr.copy()
+    work[fg == 0] = [195, 195, 195]
+
+    # ── Step 3: Heavy bilateral — 7 passes (kills texture, preserves edges) ──
+    smooth = work.copy()
+    for _ in range(7):
+        smooth = cv2.bilateralFilter(smooth, d=11, sigmaColor=90, sigmaSpace=90)
+
+    # ── Step 4: K-means 4 clusters on smoothed image ─────────────────────────
     pixel_data = smooth.reshape((-1, 3)).astype(np.float32)
-    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    criteria   = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
     _, labels, centers = cv2.kmeans(
-        pixel_data, 8, None, criteria, 5, cv2.KMEANS_RANDOM_CENTERS)
-    centers = np.uint8(centers)
+        pixel_data, 4, None, criteria, 5, cv2.KMEANS_RANDOM_CENTERS)
+    centers   = np.uint8(centers)
     quantized = centers[labels.flatten()].reshape(smooth.shape)
+    gray_q    = cv2.cvtColor(quantized, cv2.COLOR_BGR2GRAY)
+    edges1    = cv2.Canny(gray_q, 18, 50)
 
-    # ── Step 3: Detect region boundaries on quantized image ──────────────────
-    gray_q = cv2.cvtColor(quantized, cv2.COLOR_BGR2GRAY)
+    # ── Step 5: Detail pass — high-threshold Canny on lightly blurred ─────────
+    med = work.copy()
+    for _ in range(3):
+        med = cv2.bilateralFilter(med, d=7, sigmaColor=50, sigmaSpace=50)
+    gray_m = cv2.cvtColor(med, cv2.COLOR_BGR2GRAY)
+    edges2 = cv2.Canny(gray_m, 120, 300)
 
-    # Canny on flat-colour image  →  only region edges, zero texture
-    edges = cv2.Canny(gray_q, 10, 40)
+    # ── Step 6: Combine + morphological close ────────────────────────────────
+    combined = cv2.bitwise_or(edges1, edges2)
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
-    # Sobel gradient for subtle transitions Canny might miss
-    grad_x = cv2.Sobel(gray_q, cv2.CV_32F, 1, 0, ksize=3)
-    grad_y = cv2.Sobel(gray_q, cv2.CV_32F, 0, 1, ksize=3)
-    grad_mag = np.clip(cv2.magnitude(grad_x, grad_y), 0, 255).astype(np.uint8)
-    _, grad_bin = cv2.threshold(grad_mag, 20, 255, cv2.THRESH_BINARY)
+    # ── Step 7: Mask to subject region ───────────────────────────────────────
+    fg_edge  = cv2.dilate(fg, np.ones((6, 6), np.uint8), iterations=2)
+    combined = cv2.bitwise_and(combined, fg_edge)
 
-    combined = cv2.bitwise_or(edges, grad_bin)
+    # ── Step 8: Remove tiny noise (connected components < 20 px) ─────────────
+    nb, out, stats, _ = cv2.connectedComponentsWithStats(combined)
+    cleaned = np.zeros_like(combined)
+    for i in range(1, nb):
+        if stats[i, cv2.CC_STAT_AREA] > 20:
+            cleaned[out == i] = 255
 
-    # ── Step 4: Morphological cleanup ────────────────────────────────────────
-    k2 = np.ones((2, 2), np.uint8)
-    k3 = np.ones((3, 3), np.uint8)
-    combined = cv2.dilate(combined, k2, iterations=1)          # thicken lines
-    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  k2) # remove speckles
-    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k3) # close small gaps
+    # ── Step 9: Dilate for laser visibility ───────────────────────────────────
+    cleaned = cv2.dilate(cleaned, np.ones((2, 2), np.uint8), iterations=1)
 
     # Invert: lines=black(0), background=white(255)
-    return cv2.bitwise_not(combined)
+    return cv2.bitwise_not(cleaned)
 
 @app.post("/preprocess")
 async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
@@ -597,34 +626,19 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
         # ── Canny/threshold fallback ─────────────────────────────────────────
         if bw_array is None:
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (3,3), 0)
-            gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
-            mode_flag = cv2.THRESH_BINARY_INV if invert_bool else cv2.THRESH_BINARY
-            _, bw_array = cv2.threshold(gray, threshold, 255, mode_flag)
-            bw_array = cv2.morphologyEx(bw_array, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8))
+            gray = cv2.GaussianBlur(gray, (3, 3), 0)
+            _, bw_array = cv2.threshold(gray, 0, 255,
+                                        cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+            if invert_bool:
+                bw_array = cv2.bitwise_not(bw_array)
 
-        bw_pil = Image.fromarray(bw_array)
+        # ── Encode result ────────────────────────────────────────────────────
+        ok, buf = cv2.imencode(".png", bw_array)
+        if not ok:
+            raise HTTPException(status_code=500, detail="PNG encode failed")
+        return Response(content=buf.tobytes(), media_type="image/png",
+                        headers={"X-sketch-ok": str(sketch_ok)})
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bmp_path = os.path.join(tmpdir, "input.bmp")
-            svg_path = os.path.join(tmpdir, "output.svg")
-            bw_pil.save(bmp_path)
-            result = subprocess.run(
-                ["potrace","--svg","--flat",
-                 "--turdsize","2",
-                 "--alphamax","1",
-                 "--opttolerance","0.4",
-                 "-o", svg_path, bmp_path],
-                capture_output=True, timeout=60)
-            if result.returncode != 0:
-                raise Exception("Potrace error: " + result.stderr.decode())
-            with open(svg_path,"r",encoding="utf-8") as f:
-                svg_content = f.read()
-
-        return {"svg": svg_content,
-                "path_count": len(re.findall(r"<path", svg_content)),
-                "width": out_w, "height": out_h,
-                "ai_used": sketch_ok}
     except HTTPException:
         raise
     except Exception as e:
