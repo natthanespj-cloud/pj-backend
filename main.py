@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.7.0")
+app = FastAPI(title="PJ Backend", version="4.8.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.7.0 - XDoG local + controlnet-hed AI line art", "version": "4.7.0"}
+    return {"status": "PJ Backend v4.8.0 - photo line art (bilateral+kmeans) + XDoG cartoon + controlnet-hed AI", "version": "4.8.0"}
 
 @app.get("/health")
 def health():
@@ -33,7 +33,7 @@ def health():
         potrace_ok = r.returncode == 0
     except Exception:
         potrace_ok = False
-    return {"status": "ok", "version": "4.7.0", "potrace": potrace_ok}
+    return {"status": "ok", "version": "4.8.0", "potrace": potrace_ok}
 
 # ── SVG / path helpers ────────────────────────────────────────────────────────
 
@@ -400,6 +400,68 @@ def _local_line_art(img_bgr):
 
     return binary  # 0=black lines, 255=white background
 
+# ── Photo line art: bilateral smoothing + k-means quantization ───────────────
+
+def _photo_line_art(img_bgr):
+    """
+    Convert real photo → coloring-book / digital-tracing style line art.
+    Captures major silhouette outlines only — no texture/skin/fabric noise.
+
+    Pipeline:
+      1. Heavy bilateral smoothing (3 passes) → removes texture, keeps big edges
+      2. K-means quantization (8 clusters)    → flat colour zones like posterize
+      3. Canny + gradient on quantized image  → only region boundary lines
+      4. Morphological cleanup                → connect gaps, kill speckles
+
+    Returns uint8 numpy array: 0=black lines, 255=white background.
+    """
+    import cv2, numpy as np
+
+    # Resize to max 1000 px (fast enough for k-means, plenty of detail)
+    h, w = img_bgr.shape[:2]
+    if max(h, w) > 1000:
+        ratio = 1000 / max(h, w)
+        img_bgr = cv2.resize(img_bgr, (int(w * ratio), int(h * ratio)),
+                             interpolation=cv2.INTER_AREA)
+
+    # ── Step 1: Heavy bilateral smoothing (3 passes) ─────────────────────────
+    # Each pass: d=15, sigmaColor/Space=150  →  strong texture suppression
+    smooth = img_bgr.copy()
+    for _ in range(3):
+        smooth = cv2.bilateralFilter(smooth, d=15, sigmaColor=150, sigmaSpace=150)
+
+    # ── Step 2: K-means colour quantization (8 clusters) ─────────────────────
+    pixel_data = smooth.reshape((-1, 3)).astype(np.float32)
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    _, labels, centers = cv2.kmeans(
+        pixel_data, 8, None, criteria, 5, cv2.KMEANS_RANDOM_CENTERS)
+    centers = np.uint8(centers)
+    quantized = centers[labels.flatten()].reshape(smooth.shape)
+
+    # ── Step 3: Detect region boundaries on quantized image ──────────────────
+    gray_q = cv2.cvtColor(quantized, cv2.COLOR_BGR2GRAY)
+
+    # Canny on flat-colour image  →  only region edges, zero texture
+    edges = cv2.Canny(gray_q, 10, 40)
+
+    # Sobel gradient for subtle transitions Canny might miss
+    grad_x = cv2.Sobel(gray_q, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(gray_q, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.clip(cv2.magnitude(grad_x, grad_y), 0, 255).astype(np.uint8)
+    _, grad_bin = cv2.threshold(grad_mag, 20, 255, cv2.THRESH_BINARY)
+
+    combined = cv2.bitwise_or(edges, grad_bin)
+
+    # ── Step 4: Morphological cleanup ────────────────────────────────────────
+    k2 = np.ones((2, 2), np.uint8)
+    k3 = np.ones((3, 3), np.uint8)
+    combined = cv2.dilate(combined, k2, iterations=1)          # thicken lines
+    combined = cv2.morphologyEx(combined, cv2.MORPH_OPEN,  k2) # remove speckles
+    combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, k3) # close small gaps
+
+    # Invert: lines=black(0), background=white(255)
+    return cv2.bitwise_not(combined)
+
 @app.post("/preprocess")
 async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
     """Color image -> B&W line art PNG. mode: auto, cartoon, photo"""
@@ -440,7 +502,7 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
                 headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
             )
         else:
-            # photo mode: AI (controlnet-hed) → XDoG local → Canny fallback
+            # photo mode: AI (controlnet-hed) → photo line art (bilateral+kmeans) → Canny fallback
             sketch_arr = None
             try:
                 sketch_arr = _ai_line_art(img_bgr)
@@ -448,7 +510,7 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
                 pass
             if sketch_arr is None:
                 try:
-                    sketch_arr = _local_line_art(img_bgr)
+                    sketch_arr = _photo_line_art(img_bgr)
                 except Exception:
                     pass
             if sketch_arr is not None:
@@ -489,71 +551,3 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
         if img_bgr is not None:
             h, w = img_bgr.shape[:2]
             if max(h, w) > max_size:
-                ratio = max_size / max(h, w)
-                img_bgr = cv2.resize(img_bgr, (int(w*ratio), int(h*ratio)), interpolation=cv2.INTER_AREA)
-            out_w, out_h = img_bgr.shape[1], img_bgr.shape[0]
-        else:
-            # fallback PIL path
-            img_pil = Image.open(io.BytesIO(contents)).convert("RGB")
-            if max(img_pil.size) > max_size:
-                ratio = max_size / max(img_pil.size)
-                img_pil = img_pil.resize((int(img_pil.width*ratio), int(img_pil.height*ratio)), Image.LANCZOS)
-            img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
-            out_w, out_h = img_pil.width, img_pil.height
-
-        # ── AI → XDoG local → Canny fallback ────────────────────────────────
-        bw_array = None
-        sketch_ok = False
-
-        # Try AI (controlnet-hed) first
-        try:
-            sketch = _ai_line_art(img_bgr)
-            bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
-            sketch_ok = True
-        except Exception:
-            pass
-
-        # Fallback: XDoG local line art
-        if bw_array is None:
-            try:
-                sketch = _local_line_art(img_bgr)
-                bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
-                sketch_ok = True
-            except Exception:
-                bw_array = None
-
-        # ── Canny/threshold fallback ─────────────────────────────────────────
-        if bw_array is None:
-            gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-            gray = cv2.GaussianBlur(gray, (3,3), 0)
-            gray = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8)).apply(gray)
-            mode_flag = cv2.THRESH_BINARY_INV if invert_bool else cv2.THRESH_BINARY
-            _, bw_array = cv2.threshold(gray, threshold, 255, mode_flag)
-            bw_array = cv2.morphologyEx(bw_array, cv2.MORPH_CLOSE, np.ones((2,2), np.uint8))
-
-        bw_pil = Image.fromarray(bw_array)
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            bmp_path = os.path.join(tmpdir, "input.bmp")
-            svg_path = os.path.join(tmpdir, "output.svg")
-            bw_pil.save(bmp_path)
-            result = subprocess.run(
-                ["potrace","--svg","--flat",
-                 "--turdsize","2",
-                 "--alphamax","1",
-                 "--opttolerance","0.4",
-                 "-o", svg_path, bmp_path],
-                capture_output=True, timeout=60)
-            if result.returncode != 0:
-                raise Exception("Potrace error: " + result.stderr.decode())
-            with open(svg_path,"r",encoding="utf-8") as f:
-                svg_content = f.read()
-
-        return {"svg": svg_content,
-                "path_count": len(re.findall(r"<path", svg_content)),
-                "width": out_w, "height": out_h,
-                "ai_used": sketch_ok}
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
