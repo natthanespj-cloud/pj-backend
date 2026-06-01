@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.9.0")
+app = FastAPI(title="PJ Backend", version="4.9.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -15,16 +15,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ── unit conversion ──────────────────────────────────────────────────────────
+# ââ unit conversion ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 # Potrace outputs SVG path coordinates in pixels at its default 72 dpi.
-# 1 potrace pixel = 1 pt = 25.4/72 mm  →  apply this to every DXF coordinate
+# 1 potrace pixel = 1 pt = 25.4/72 mm  â  apply this to every DXF coordinate
 # so CypCut (INSUNITS=4, mm) gets the correct physical size.
-PT_TO_MM = 25.4 / 72          # ≈ 0.35278  (potrace default resolution: 72 dpi)
+PT_TO_MM = 25.4 / 72          # â 0.35278  (potrace default resolution: 72 dpi)
 MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.9.0 - photo line art (GrabCut+bilateral+kmeans) + XDoG cartoon", "version": "4.9.0"}
+    return {"status": "PJ Backend v4.9.1 - photo line art (GrabCut+bilateral+kmeans) + XDoG cartoon", "version": "4.9.1"}
 
 @app.get("/health")
 def health():
@@ -33,9 +33,9 @@ def health():
         potrace_ok = r.returncode == 0
     except Exception:
         potrace_ok = False
-    return {"status": "ok", "version": "4.8.0", "potrace": potrace_ok}
+    return {"status": "ok", "version": "4.9.1", "potrace": potrace_ok}
 
-# ── SVG / path helpers ────────────────────────────────────────────────────────
+# ââ SVG / path helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
 def parse_svg_commands(d):
     tokens = re.findall(
@@ -100,8 +100,8 @@ def svg_path_to_polylines(d, sx_mm, sy_mm):
         prev = (p0x, p0y)
         for k in range(1, n+1):
             t2 = k/n; tm = (k-0.5)/n
-            curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
-            mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
+            curr = bezier_at((p0x,p0y).(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
+            mid  = bezier_at((p0x,p0y),(cp1x,cp1e),(cp2x,cp2y),(p3x,p3y),tm)
             b = compute_bulge((dx(prev[0]),dy(prev[1])),(dx(mid[0]),dy(mid[1])),(dx(curr[0]),dy(curr[1])))
             if verts: verts[-1][2] = b
             verts.append([dx(curr[0]),dy(curr[1]),0.0]); prev = curr
@@ -138,7 +138,7 @@ def svg_path_to_polylines(d, sx_mm, sy_mm):
     return result
 
 def _svg_path_to_polylines_yflip(d, svg_h, scale_mm):
-    """Fallback: plain SVG (Y-down) → DXF (Y-up), coordinates in mm."""
+    """Fallback: plain SVG (Y-down) â DXF (Y-up), coordinates in mm."""
     commands = parse_svg_commands(d)
     result = []; verts = []; cx = cy = 0.0; start_x = start_y = 0.0; closed = False
 
@@ -175,7 +175,7 @@ def _svg_path_to_polylines_yflip(d, svg_h, scale_mm):
                 cx+=args[j]; cy+=args[j+1]; verts.append([fx(cx),fy(cy),0.0])
         elif cmd == 'C':
             for j in range(0,len(args),6):
-                add_bezier(cx,cy,args[j],args[j+1],args[j+3],args[j+3],args[j+4],args[j+5])
+                add_bezier(cx,cy,args[j],args[j+1],args[j+2],args[j+3],args[j+4],args[j+5])
         elif cmd == 'c':
             for j in range(0,len(args),6):
                 add_bezier(cx,cy,cx+args[j],cy+args[j+1],cx+args[j+2],cy+args[j+3],cx+args[j+4],cy+args[j+5])
@@ -210,9 +210,9 @@ def build_dxf(svg_content, selected="all"):
     vb = root.get('viewBox', '0 0 500 500').split()
     svg_h = float(vb[3]) if len(vb) >= 4 else 500.0
 
-    # ── detect potrace transform and build mm-scale factors ──────────────────
+    # ââ detect potrace transform and build mm-scale factors ââââââââââââââââââ
     # Potrace emits: <g transform="translate(0,H) scale(s,-s)">
-    # Path data coords are in potrace pixels; scale s converts pixels→SVG pts.
+    # Path data coords are in potrace pixels; scale s converts pixelsâSVG pts.
     # We multiply by PT_TO_MM so DXF values come out in real millimetres.
     scale_x_raw = scale_y_raw = 1.0; has_transform = False
     for el in root.iter():
@@ -265,11 +265,11 @@ async def export_dxf(svg: str = Form(...), selected: str = Form("all")):
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# ── AI line art via Replicate controlnet-hed ─────────────────────────────────
+# ââ AI line art via Replicate controlnet-hed âââââââââââââââââââââââââââââââââ
 
 def _ai_line_art(img_bgr):
     """
-    Convert photo → clean line art using jagilley/controlnet-hed via Replicate.
+    Convert photo â clean line art using jagilley/controlnet-hed via Replicate.
     Returns uint8 numpy array: 0=black lines, 255=white background.
     Raises exception if REPLICATE_API_TOKEN not set or call fails.
     """
@@ -345,11 +345,11 @@ def _ai_line_art(img_bgr):
     _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
     return binary  # 0=black lines, 255=white background
 
-# ── Local line art: XDoG (Extended Difference of Gaussians) ──────────────────
+# ââ Local line art: XDoG (Extended Difference of Gaussians) ââââââââââââââââââ
 
 def _local_line_art(img_bgr):
     """
-    Convert photo → clean line art using XDoG algorithm.
+    Convert photo â clean line art using XDoG algorithm.
     Gives crisp illustration + anime/cartoon style edges for laser cutting.
     Returns uint8 numpy array: 0=black lines, 255=white background.
     """
@@ -374,10 +374,10 @@ def _local_line_art(img_bgr):
     # Convert to float grayscale [0, 1]
     gray = cv2.cvtColor(smooth, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
 
-    # ── XDoG (Extended Difference of Gaussians) ──────────────────────────────
+    # ââ XDoG (Extended Difference of Gaussians) ââââââââââââââââââââââââââââââ
     # Parameters tuned for illustration + anime combined style
     sigma   = 1.0    # base Gaussian sigma (edge sharpness)
-    k       = 1.6    # sigma ratio — k*sigma for second Gaussian
+    k       = 1.6    # sigma ratio â k*sigma for second Gaussian
     epsilon = 0.98   # threshold level (higher = fewer, cleaner lines)
     phi     = 200.0  # steepness of soft threshold (higher = crisper edges)
 
@@ -387,7 +387,7 @@ def _local_line_art(img_bgr):
     # DoG response: positive = background, negative = edge
     dog = g1 - epsilon * g2
 
-    # XDoG soft threshold: background → 1.0, edges → 0.0
+    # XDoG soft threshold: background â 1.0, edges â 0.0
     xdog = np.where(dog >= 0, 1.0, 1.0 + np.tanh(phi * dog))
     xdog = np.clip(xdog, 0.0, 1.0)
 
@@ -400,28 +400,28 @@ def _local_line_art(img_bgr):
 
     return binary  # 0=black lines, 255=white background
 
-# ── Photo line art: bilateral smoothing + k-means quantization ───────────────
+# ââ Photo line art: bilateral smoothing + k-means quantization âââââââââââââââ
 
 def _photo_line_art(img_bgr):
     """
-    Convert real photo → clean line art for laser cutting.
+    Convert real photo â clean line art for laser cutting.
 
     Pipeline:
-      1. Fast GrabCut on downscaled image → subject mask (removes background)
-      2. Background filled with neutral gray → no spurious edge at boundary
-      3. Heavy bilateral (7 passes)        → kills skin/fabric texture
-      4. K-means 4 clusters                → merge into major colour zones
-      5. Canny(18,50) on quantized         → main region boundary lines
-      6. Detail pass: Canny(120,300) on lightly blurred → eyes, glasses, hair
-      7. Mask edges to subject region      → suppress background objects
-      8. Connected-component size filter   → remove tiny noise blobs
-      9. Dilate ×1                         → thicken for laser visibility
+      1. Fast GrabCut on downscaled image â subject mask (removes background)
+      2. Background filled with neutral gray â no spurious edge at boundary
+      3. Heavy bilateral (7 passes)        â kills skin/fabric texture
+      4. K-means 4 clusters                â merge into major colour zones
+      5. Canny(18,50) on quantized         â main region boundary lines
+      6. Detail pass: Canny(120,300) on lightly blurred â eyes, glasses, hair
+      7. Mask edges to subject region      â suppress background objects
+      8. Connected-component size filter   â remove tiny noise blobs
+      9. Dilate Ã1                         â thicken for laser visibility
 
     Returns uint8 numpy array: 0=black lines, 255=white background.
     """
     import cv2, numpy as np
 
-    # ── Step 0: Resize to max 1000 px ────────────────────────────────────────
+    # ââ Step 0: Resize to max 1000 px ââââââââââââââââââââââââââââââââââââââââ
     h, w = img_bgr.shape[:2]
     if max(h, w) > 1000:
         ratio = 1000 / max(h, w)
@@ -429,7 +429,7 @@ def _photo_line_art(img_bgr):
                              interpolation=cv2.INTER_AREA)
     h, w = img_bgr.shape[:2]
 
-    # ── Step 1: Fast GrabCut at 400 px → subject mask ────────────────────────
+    # ââ Step 1: Fast GrabCut at 400 px â subject mask ââââââââââââââââââââââââ
     # Downscale for speed (~0.7 s), upscale result mask back to full size
     scale  = 400 / max(h, w)
     small  = cv2.resize(img_bgr, (int(w * scale), int(h * scale)))
@@ -444,16 +444,16 @@ def _photo_line_art(img_bgr):
     fg = cv2.morphologyEx(fg, cv2.MORPH_CLOSE, np.ones((20, 20), np.uint8))
     fg = cv2.dilate(fg, np.ones((5, 5), np.uint8), iterations=2)
 
-    # ── Step 2: Background → neutral gray ────────────────────────────────────
+    # ââ Step 2: Background â neutral gray ââââââââââââââââââââââââââââââââââââ
     work = img_bgr.copy()
     work[fg == 0] = [195, 195, 195]
 
-    # ── Step 3: Heavy bilateral — 7 passes (kills texture, preserves edges) ──
+    # ââ Step 3: Heavy bilateral â 7 passes (kills texture, preserves edges) ââ
     smooth = work.copy()
     for _ in range(7):
         smooth = cv2.bilateralFilter(smooth, d=11, sigmaColor=90, sigmaSpace=90)
 
-    # ── Step 4: K-means 4 clusters on smoothed image ─────────────────────────
+    # ââ Step 4: K-means 4 clusters on smoothed image âââââââââââââââââââââââââ
     pixel_data = smooth.reshape((-1, 3)).astype(np.float32)
     criteria   = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
     _, labels, centers = cv2.kmeans(
@@ -463,29 +463,29 @@ def _photo_line_art(img_bgr):
     gray_q    = cv2.cvtColor(quantized, cv2.COLOR_BGR2GRAY)
     edges1    = cv2.Canny(gray_q, 18, 50)
 
-    # ── Step 5: Detail pass — high-threshold Canny on lightly blurred ─────────
+    # ââ Step 5: Detail pass â high-threshold Canny on lightly blurred âââââââââ
     med = work.copy()
     for _ in range(3):
         med = cv2.bilateralFilter(med, d=7, sigmaColor=50, sigmaSpace=50)
     gray_m = cv2.cvtColor(med, cv2.COLOR_BGR2GRAY)
     edges2 = cv2.Canny(gray_m, 120, 300)
 
-    # ── Step 6: Combine + morphological close ────────────────────────────────
+    # ââ Step 6: Combine + morphological close ââââââââââââââââââââââââââââââââ
     combined = cv2.bitwise_or(edges1, edges2)
     combined = cv2.morphologyEx(combined, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8))
 
-    # ── Step 7: Mask to subject region ───────────────────────────────────────
+    # ââ Step 7: Mask to subject region âââââââââââââââââââââââââââââââââââââââ
     fg_edge  = cv2.dilate(fg, np.ones((6, 6), np.uint8), iterations=2)
     combined = cv2.bitwise_and(combined, fg_edge)
 
-    # ── Step 8: Remove tiny noise (connected components < 20 px) ─────────────
+    # ââ Step 8: Remove tiny noise (connected components < 20 px) âââââââââââââ
     nb, out, stats, _ = cv2.connectedComponentsWithStats(combined)
     cleaned = np.zeros_like(combined)
     for i in range(1, nb):
         if stats[i, cv2.CC_STAT_AREA] > 20:
             cleaned[out == i] = 255
 
-    # ── Step 9: Dilate for laser visibility ───────────────────────────────────
+    # ââ Step 9: Dilate for laser visibility âââââââââââââââââââââââââââââââââââ
     cleaned = cv2.dilate(cleaned, np.ones((2, 2), np.uint8), iterations=1)
 
     # Invert: lines=black(0), background=white(255)
@@ -515,7 +515,7 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
             total = img_bgr.shape[0] * img_bgr.shape[1]
             near_white = float((v > 200).sum()) / total
             near_black = float((v < 50).sum()) / total
-            bw_ratio = near_white + near_black   # high → already B&W line art
+            bw_ratio = near_white + near_black   # high â already B&W line art
             detected_mode = "cartoon" if bw_ratio > 0.85 else "photo"
 
         if detected_mode == "cartoon":
@@ -531,10 +531,12 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
                 headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
             )
         else:
-            # photo mode: AI (controlnet-hed) → photo line art (bilateral+kmeans) → Canny fallback
+            # photo mode: AI (controlnet-hed) â photo line art (bilateral+kmeans) â Canny fallback
             sketch_arr = None
+            ai_used = False
             try:
                 sketch_arr = _ai_line_art(img_bgr)
+                ai_used = True
             except Exception:
                 pass
             if sketch_arr is None:
@@ -547,7 +549,7 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
                 return Response(
                     content=png_buf.tobytes(),
                     media_type="image/png",
-                    headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
+                    headers={"X-Mode": detected_mode, "X-AI-Used": str(ai_used).lower(), "Access-Control-Expose-Headers": "X-Mode, X-AI-Used"}
                 )
             # Canny fallback
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
@@ -559,7 +561,7 @@ async def preprocess_image(image: UploadFile, mode: str = Form("auto")):
             return Response(
                 content=png_buf.tobytes(),
                 media_type="image/png",
-                headers={"X-Mode": detected_mode, "Access-Control-Expose-Headers": "X-Mode"}
+                headers={"X-Mode": detected_mode, "X-AI-Used": "false", "Access-Control-Expose-Headers": "X-Mode, X-AI-Used"}
             )
     except HTTPException:
         raise
@@ -575,7 +577,7 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
         arr = np.frombuffer(contents, np.uint8)
         img_bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
 
-        # ── resize ──────────────────────────────────────────────────────────
+        # ââ resize ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
         max_size = 2000
         if img_bgr is not None:
             h, w = img_bgr.shape[:2]
@@ -592,26 +594,28 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
             img_bgr = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
             out_w, out_h = img_pil.width, img_pil.height
 
-        # ── Detect photo vs cartoon ──────────────────────────────────────────
+        # ââ Detect photo vs cartoon ââââââââââââââââââââââââââââââââââââââââââ
         hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
         v = hsv[:, :, 2]
         total_px = img_bgr.shape[0] * img_bgr.shape[1]
         bw_ratio = float((v > 200).sum() + (v < 50).sum()) / total_px
         is_photo = bw_ratio <= 0.85
 
-        # ── AI → local (photo/cartoon) → Canny fallback ─────────────────────
+        # ââ AI â local (photo/cartoon) â Canny fallback âââââââââââââââââââââ
         bw_array = None
         sketch_ok = False
 
         # Try AI (controlnet-hed) first
+        ai_used = False
         try:
             sketch = _ai_line_art(img_bgr)
             bw_array = cv2.bitwise_not(sketch) if invert_bool else sketch
             sketch_ok = True
+            ai_used = True
         except Exception:
             pass
 
-        # Local fallback: photo → bilateral+kmeans, cartoon → XDoG
+        # Local fallback: photo â bilateral+kmeans, cartoon â XDoG
         if bw_array is None:
             try:
                 if is_photo:
@@ -623,7 +627,7 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
             except Exception:
                 bw_array = None
 
-        # ── Canny/threshold fallback ─────────────────────────────────────────
+        # ââ Canny/threshold fallback âââââââââââââââââââââââââââââââââââââââââ
         if bw_array is None:
             gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
             gray = cv2.GaussianBlur(gray, (3, 3), 0)
@@ -632,13 +636,12 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
             if invert_bool:
                 bw_array = cv2.bitwise_not(bw_array)
 
-        # ── Encode result ────────────────────────────────────────────────────
+        # ââ Encode result ââââââââââââââââââââââââââââââââââââââââââââââââââââ
         ok, buf = cv2.imencode(".png", bw_array)
         if not ok:
             raise HTTPException(status_code=500, detail="PNG encode failed")
         return Response(content=buf.tobytes(), media_type="image/png",
-                        headers={"X-sketch-ok": str(sketch_ok)})
-
+                        headers={"X-sketch-ok": str(sketch_ok), "X-AI-Used": str(ai_used).lower(), "Access-Control-Expose-Headers": "X-sketch-ok, X-AI-Used"})
     except HTTPException:
         raise
     except Exception as e:
