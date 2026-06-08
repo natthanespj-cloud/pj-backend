@@ -100,8 +100,8 @@ def svg_path_to_polylines(d, sx_mm, sy_mm):
         prev = (p0x, p0y)
         for k in range(1, n+1):
             t2 = k/n; tm = (k-0.5)/n
-            curr = bezier_at((p0x,p0y).(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
-            mid  = bezier_at((p0x,p0y),(cp1x,cp1e),(cp2x,cp2y),(p3x,p3y),tm)
+            curr = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),t2)
+            mid  = bezier_at((p0x,p0y),(cp1x,cp1y),(cp2x,cp2y),(p3x,p3y),tm)
             b = compute_bulge((dx(prev[0]),dy(prev[1])),(dx(mid[0]),dy(mid[1])),(dx(curr[0]),dy(curr[1])))
             if verts: verts[-1][2] = b
             verts.append([dx(curr[0]),dy(curr[1]),0.0]); prev = curr
