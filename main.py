@@ -6,7 +6,7 @@ import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.9.1")
+app = FastAPI(title="PJ Backend", version="4.9.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.9.1 - photo line art (GrabCut+bilateral+kmeans) + XDoG cartoon", "version": "4.9.1"}
+    return {"status": "PJ Backend v4.9.2 - photo line art (GrabCut+bilateral+kmeans) + XDoG cartoon", "version": "4.9.2"}
 
 @app.get("/health")
 def health():
@@ -33,7 +33,7 @@ def health():
         potrace_ok = r.returncode == 0
     except Exception:
         potrace_ok = False
-    return {"status": "ok", "version": "4.9.1", "potrace": potrace_ok}
+    return {"status": "ok", "version": "4.9.2", "potrace": potrace_ok}
 
 # ââ SVG / path helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
