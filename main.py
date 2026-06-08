@@ -1,12 +1,12 @@
 from fastapi import FastAPI, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, JSONResponse
 from PIL import Image
 import subprocess, tempfile, os, io, re, math
 import xml.etree.ElementTree as ET
 import ezdxf
 
-app = FastAPI(title="PJ Backend", version="4.9.2")
+app = FastAPI(title="PJ Backend", version="4.9.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -24,7 +24,7 @@ MIN_PATH_MM = 1.0              # discard polylines shorter than 1 mm (noise)
 
 @app.get("/")
 def root():
-    return {"status": "PJ Backend v4.9.2 - photo line art (GrabCut+bilateral+kmeans) + XDoG cartoon", "version": "4.9.2"}
+    return {"status": "PJ Backend v4.9.3 - photo line art (GrabCut+bilateral+kmeans) + XDoG cartoon", "version": "4.9.3"}
 
 @app.get("/health")
 def health():
@@ -33,7 +33,7 @@ def health():
         potrace_ok = r.returncode == 0
     except Exception:
         potrace_ok = False
-    return {"status": "ok", "version": "4.9.2", "potrace": potrace_ok}
+    return {"status": "ok", "version": "4.9.3", "potrace": potrace_ok}
 
 # ââ SVG / path helpers ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
 
@@ -637,11 +637,31 @@ async def trace_image(image: UploadFile, threshold: int = Form(128), invert: str
                 bw_array = cv2.bitwise_not(bw_array)
 
         # ââ Encode result ââââââââââââââââââââââââââââââââââââââââââââââââââââ
-        ok, buf = cv2.imencode(".png", bw_array)
-        if not ok:
-            raise HTTPException(status_code=500, detail="PNG encode failed")
-        return Response(content=buf.tobytes(), media_type="image/png",
-                        headers={"X-sketch-ok": str(sketch_ok), "X-AI-Used": str(ai_used).lower(), "Access-Control-Expose-Headers": "X-sketch-ok, X-AI-Used"})
+        # ── Potrace: binary image → SVG ──────────────────────────────────
+        tmp_png = tempfile.NamedTemporaryFile(suffix='.png', delete=False)
+        tmp_svg = tmp_png.name.replace('.png', '.svg')
+        try:
+            cv2.imwrite(tmp_png.name, bw_array)
+            tmp_png.close()
+            proc = subprocess.run(
+                ['potrace', '--svg', '--output', tmp_svg, tmp_png.name],
+                capture_output=True, timeout=30
+            )
+            if proc.returncode != 0:
+                raise Exception('potrace failed: ' + proc.stderr.decode())
+            with open(tmp_svg, 'r', encoding='utf-8') as f:
+                svg_content = f.read()
+        finally:
+            for p in [tmp_png.name, tmp_svg]:
+                try: os.unlink(p)
+                except: pass
+
+        path_count = svg_content.count('<path')
+        return JSONResponse(
+            content={"svg": svg_content, "path_count": path_count, "aiUsed": ai_used},
+            headers={"X-sketch-ok": str(sketch_ok), "X-AI-Used": str(ai_used).lower(),
+                     "Access-Control-Expose-Headers": "X-sketch-ok, X-AI-Used"}
+        )
     except HTTPException:
         raise
     except Exception as e:
